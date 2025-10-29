@@ -1,2 +1,6 @@
 from google.colab import drive
 drive.mount('/content/drive')
+
+
+SAVE_DIR = Path("/content/drive/MyDrive/mlp_results/mnist_compare")
+
