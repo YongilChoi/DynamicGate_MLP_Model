@@ -1,0 +1,381 @@
+Colab share link : 
+https://colab.research.google.com/drive/17zG4KVomGABRm2jawqIA-JmxGH-81x3Q?usp=sharing
+
+
+
+# ============================================
+# MNIST: Baseline / Dropout / Pruned / Gate-MLP
+# 통합 실험 코드 (Google Colab Friendly)
+# ============================================
+
+import random, torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# -------------------- 설정 --------------------
+epochs = 50
+batch_size = 128
+lr = 1e-3
+hidden = 256
+gate_beta = 1e-3
+tau = 0.3
+prune_ratio = 0.3   # Pruned MLP에서 제거할 비율
+seed = 42
+
+# -------------------- 시드 고정 --------------------
+def set_seed(seed=42):
+    print("시드 값:", seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+set_seed(seed)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# -------------------- 모델 정의 --------------------
+class MLP(nn.Module):
+    def __init__(self, input_dim=784, hidden_dim=256, output_dim=10):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        return self.fc2(x)
+
+class DropoutMLP(nn.Module):
+    def __init__(self, input_dim=784, hidden_dim=256, output_dim=10, p=0.5):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.drop = nn.Dropout(p)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        x = self.drop(x)
+        return self.fc2(x)
+
+class GateLayer(nn.Module):
+    def __init__(self, size, tau=0.5):
+        super().__init__()
+        # self.gate_logits = nn.Parameter(torch.zeros(size))
+        # 학습 가능한 게이트 로짓 값 (초기에는 모두 2.0 → sigmoid≈0.88 → 거의 열림)
+        self.gate_logits = nn.Parameter(torch.ones(size) * 2.0)  # → 초기에는 대부분 게이트=1 (연결 열림).
+        self.tau = tau
+
+# 1. self.gate_logits
+
+# 학습 가능한 파라미터 (길이 = size, 즉 은닉 뉴런 개수와 같음)
+
+# 초기값을 2.0으로 주었기 때문에,
+# sigmoid(2.0) ≈ 0.88 → 대부분 게이트는 “열림(1에 가까움)” 상태로 시작합니다.
+
+# 학습 과정에서 optimizer가 이 값을 업데이트 → 게이트가 닫히거나 열릴 수 있음.
+#
+    def forward(self, x):
+        # (1) 게이트 확률 계산 (0~1 사이)
+      #
+      #  2. probs = torch.sigmoid(self.gate_logits)
+
+      #   각 뉴런마다 **게이트 확률(0~1)**을 만듭니다.
+
+      #   예: 어떤 뉴런의 gate_logit=0이면 sigmoid(0)=0.5 → 열릴 확률 50%
+
+        probs = torch.sigmoid(self.gate_logits)
+
+
+        # (2) hard threshold 적용 → 0 또는 1
+        # """
+        # 3. hard = (probs > self.tau).float()
+
+        # 확률값을 실제 0/1 이진 값으로 변환합니다.
+
+        # tau는 threshold (기본 0.5)
+
+        # probs > 0.5 → 게이트 열림(1)
+
+        # probs ≤ 0.5 → 게이트 닫힘(0)
+
+        # 즉, forward 시에는 뉴런을 살릴지(1) 죽일지(0) 결정합니다.
+        # """
+
+        hard = (probs > self.tau).float()
+
+        # (3) Straight-Through Estimator 방식: forward에서는 hard값을 쓰되, backward에서는 확률적 gradient가 흘러가게 함
+# """
+# 4. gates = hard + (probs - hard).detach()
+
+# 여기서 중요한 트릭이 들어갑니다 → Straight-Through Estimator (STE)
+
+# forward 계산에서는 hard (즉, 0/1 값) 그대로 사용하지만,
+
+# backward 시 gradient는 probs에서 온 미분값을 흘려보냅니다.
+
+# 👉 이렇게 하면 “게이트는 이진값”으로 동작하면서도, 학습 시에는 부드럽게 gradient 업데이트가 가능합니다.
+
+
+
+# """
+        gates = hard + (probs - hard).detach()
+
+        # (4) 입력에 게이트 적용 (뉴런마다 곱해줌)
+# """
+# 5. return x * gates, probs
+
+# 실제로는 입력 x의 각 뉴런에 대해 게이트(0/1)를 곱합니다.
+
+# gate=1 → 뉴런 통과
+
+# gate=0 → 뉴런 차단
+
+# 동시에, 학습 모니터링을 위해 **확률(probs)**도 함께 반환합니다.
+
+# """
+        return x * gates, probs
+
+# """
+# GateLayer는 뉴런 단위의 ON/OFF 스위치를 학습 가능한 파라미터(gate_logits)로 만들어,
+
+# forward 시엔 뉴런을 껐다 켰다(0/1),
+
+# backward 시엔 gradient가 잘 흘러가도록 하는 뉴런 선택 레이어입니다.
+
+# 비슷한 개념
+
+# 드롭아웃(Dropout): 무작위로 뉴런을 끊음 (학습 중만)
+
+# 게이트레이어: 학습을 통해 어떤 뉴런을 끊을지 결정 (훈련 후에도 구조가 고정 가능 → 모델 압축, pruning 유사 효과)
+# """
+
+# """
+# #은닉-출력에만 게이트 적용
+# class DynamicGateMLP(nn.Module):
+#     def __init__(self, input_dim=784, hidden_dim=256, output_dim=10, tau=0.5):
+#         super().__init__()
+#         self.fc1 = nn.Linear(input_dim, hidden_dim)  # 입력 → 은닉 (Linear)
+#         self.gate = GateLayer(hidden_dim, tau)
+#         self.fc2 = nn.Linear(hidden_dim, output_dim)  # 은닉 → 출력
+#     def forward(self, x):
+#         x = x.view(x.size(0), -1)
+#         x = self.fc1(x)
+#         x, probs = self.gate(x) # 은닉 출력에 게이트 적용
+#         x = F.relu(x)  # 활성화
+#         return self.fc2(x), probs
+# """
+# 입력-은닉, 은닉-출력 모두 게이트 적용
+class DynamicGateMLP(nn.Module):
+    def __init__(self, input_dim=784, hidden_dim=256, output_dim=10, tau=0.5):
+        super().__init__()
+        self.gate_in  = GateLayer(input_dim, tau)     # 입력 게이트
+        self.fc1      = nn.Linear(input_dim, hidden_dim)
+        self.gate_hid = GateLayer(hidden_dim, tau)    # 은닉 게이트
+        self.fc2      = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x, _ = self.gate_in(x)         # 입력 차원 게이트
+        x = self.fc1(x)
+        x, probs = self.gate_hid(x)    # 은닉 차원 게이트
+        x = F.relu(x)
+        return self.fc2(x), probs
+
+# -------------------- 데이터 --------------------
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.1307,), (0.3081,))
+])
+train_ds = datasets.MNIST("./data", train=True, download=True, transform=transform)
+test_ds  = datasets.MNIST("./data", train=False, download=True, transform=transform)
+train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+test_loader  = DataLoader(test_ds, batch_size=512, shuffle=False)
+
+# -------------------- 학습/평가 함수 --------------------
+def train_epoch(model, loader, opt, device, crit, gate_beta=0.0):
+    model.train(); total, correct = 0, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        opt.zero_grad()
+        out = model(x)
+        if isinstance(out, tuple):
+            logits, probs = out
+            loss = crit(logits, y) + gate_beta * probs.mean()
+        else:
+            logits = out
+            loss = crit(logits, y)
+        loss.backward(); opt.step()
+        correct += (logits.argmax(1) == y).sum().item()
+        total += y.size(0)
+    return correct / total
+
+@torch.no_grad()
+def test_epoch(model, loader, device, crit):
+    model.eval(); total, correct = 0, 0; gate_probs = []
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        out = model(x)
+        if isinstance(out, tuple):
+            logits, probs = out
+            gate_probs.append(probs.mean().item())
+        else:
+            logits = out
+        correct += (logits.argmax(1) == y).sum().item()
+        total += y.size(0)
+    return correct / total, (sum(gate_probs)/len(gate_probs) if gate_probs else None)
+
+# -------------------- FLOPs & Params 계산 --------------------
+def compute_stats(model, active_ratio=None):
+    params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # FLOPs 근사 (fc1 + fc2)
+    if hasattr(model, 'fc1'):
+        flops = 784*hidden + hidden*10
+    else:
+        flops = 0
+    if active_ratio is not None:
+        flops = int(flops * active_ratio)
+    return params, flops
+
+# -------------------- Pruning 함수 --------------------
+def apply_pruning(model, ratio=0.3):
+    with torch.no_grad():
+        weight = model.fc1.weight.abs()
+        thresh = torch.quantile(weight.view(-1), ratio)
+        mask = (weight > thresh).float()
+        model.fc1.weight *= mask
+    return model
+
+# -----------추가할 함수: show_gate_matrix ----------------
+def show_gate_matrix(model, rows=8, cols=8):
+    # """
+    # DynamicGate-MLP 모델의 GateLayer 값을 보기 좋게 출력하는 함수
+    # - 확률값 (0~1)
+    # - Hard 값 (0/1)
+    # - 전체 합계
+    # - 행렬 및 히트맵
+    # """
+    if not hasattr(model, "gate"):  # 은닉층 다음에 게이트레이어만 적용시에
+        print("This model has no GateLayer.")
+        return
+
+    # if not hasattr(model, "gate_in"):
+    #     print("This model has no GateLayer.")
+    #     return
+    with torch.no_grad():
+        probs = torch.sigmoid(model.gate.gate_logits).cpu().numpy()
+        hard = (probs > model.gate.tau).astype(int)
+
+    # DataFrame 출력
+    df_probs = pd.DataFrame(probs.reshape(1, -1))
+    df_hard  = pd.DataFrame(hard.reshape(1, -1))
+
+    print("\nGate probabilities (0~1):")
+    display(df_probs)
+
+    print("\nGate hard values (0/1):")
+    display(df_hard)
+
+    print(f"\nActive gates: {df_hard.values.sum()} / {df_hard.size}")
+
+    # 행렬 형태로 변환
+    try:
+        hard_matrix = hard.reshape(rows, cols)
+        plt.imshow(hard_matrix, cmap="Greens", aspect="auto")
+        plt.colorbar(label="Gate (0=off, 1=on)")
+        plt.title("DynamicGate-MLP Gate Status (0=off, 1=on)")
+        plt.show()
+    except Exception as e:
+        print("Cannot reshape to matrix:", e)
+
+# -------------------- 실행 --------------------
+crit = nn.CrossEntropyLoss()
+results = []
+
+# Baseline MLP
+mlp = MLP(hidden_dim=hidden).to(device)
+opt = torch.optim.Adam(mlp.parameters(), lr=lr)
+for e in range(epochs):
+    tr = train_epoch(mlp, train_loader, opt, device, crit)
+    te, _ = test_epoch(mlp, test_loader, device, crit)
+print("Baseline MLP acc:", te)
+params, flops = compute_stats(mlp)
+results.append(["Baseline MLP", te*100, 0, 0, params, flops])
+
+# Dropout MLP
+drop = DropoutMLP(hidden_dim=hidden, p=0.5).to(device)
+opt_d = torch.optim.Adam(drop.parameters(), lr=lr)
+for e in range(epochs):
+    tr = train_epoch(drop, train_loader, opt_d, device, crit)
+    te, _ = test_epoch(drop, test_loader, device, crit)
+print("Dropout MLP acc:", te)
+params, flops = compute_stats(drop)
+results.append(["Dropout MLP", te*100, 0, 0, params, flops])
+
+# Pruned MLP
+pruned = MLP(hidden_dim=hidden).to(device)
+pruned = apply_pruning(pruned, prune_ratio)
+opt_p = torch.optim.Adam(pruned.parameters(), lr=lr)
+for e in range(epochs):
+    tr = train_epoch(pruned, train_loader, opt_p, device, crit)
+    te, _ = test_epoch(pruned, test_loader, device, crit)
+print("Pruned MLP acc:", te)
+params, flops = compute_stats(pruned, active_ratio=(1-prune_ratio))
+results.append(["Pruned MLP", te*100, prune_ratio*100, prune_ratio*100, params, flops])
+
+# DynamicGate-MLP
+gate = DynamicGateMLP(hidden_dim=hidden, tau=tau).to(device)
+opt_g = torch.optim.Adam(gate.parameters(), lr=lr)
+for e in range(epochs):
+    tr = train_epoch(gate, train_loader, opt_g, device, crit, gate_beta=gate_beta)
+    te, gp = test_epoch(gate, test_loader, device, crit)
+print("Gate MLP acc:", te, "mean gate:", gp)
+params, flops = compute_stats(gate, active_ratio=gp)
+results.append(["DynamicGate-MLP", te*100, (1-gp)*100, (1-gp)*100, params, flops])
+
+# -------------------- 결과 표 --------------------
+df = pd.DataFrame(results, columns=["Model","Accuracy(%)","Param Reduction(%)","FLOPs Reduction(%)","Params","FLOPs"])
+display(df)
+
+# GateLayer 값 보기
+#show_gate_matrix(gate, rows=8, cols=8)   # hidden=64일 때 8x8
+show_gate_matrix(gate, rows=16, cols=16) # hidden=256일 때 16x16
+
+# -------------------- 그래프 시각화 --------------------
+import numpy as np
+
+# 모델 이름
+models = df["Model"].tolist()
+
+# 정확도 그래프
+plt.figure(figsize=(12,4))
+plt.subplot(1,3,1)
+plt.bar(models, df["Accuracy(%)"], color="skyblue")
+plt.title("Accuracy (%)")
+plt.ylabel("Accuracy (%)")
+plt.xticks(rotation=20)
+
+# 파라미터 수 그래프 (로그 스케일로도 유용)
+plt.subplot(1,3,2)
+plt.bar(models, df["Params"], color="lightgreen")
+plt.title("Number of Parameters")
+plt.ylabel("Params")
+plt.xticks(rotation=20)
+
+# FLOPs 그래프
+plt.subplot(1,3,3)
+plt.bar(models, df["FLOPs"], color="salmon")
+plt.title("FLOPs (Computation Cost)")
+plt.ylabel("FLOPs")
+plt.xticks(rotation=20)
+
+plt.suptitle("Model Comparison: Accuracy / Params / FLOPs", fontsize=14)
+plt.tight_layout()
+plt.show()
+
+
+
+
