@@ -1,0 +1,371 @@
+# ============================================
+# MNIST: Baseline MLP vs DynamicGate-MLP
+# - Weights/Bias CSV 저장
+# - Gate 행렬(확률, 하드) CSV 저장
+# - 수치 비교표 출력
+# (Colab Friendly)
+# ============================================
+
+import os, random, math
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+
+# -------------------- 설정 --------------------
+EPOCHS = 2              # 빠른 확인용. 필요시 늘리세요.
+BATCH_SIZE = 128
+LR = 1e-3
+HIDDEN = 256
+SEED = 42
+
+# Dynamic Gate 하이퍼파라미터
+TAU = 0.3               # hard gate threshold
+GATE_BETA = 1e-4        # 게이트 L1(=sparsity) 규제 강도
+
+# 저장/출력 옵션
+PRINT_DECIMALS = 4
+PRINT_MAX_ROWS = 10
+PRINT_MAX_COLS = 14
+SAVE_DIR = Path("/content/mnist_compare")   # 드라이브에 보존하려면 변경
+
+# -------------------- 유틸 --------------------
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def tensor_to_text_matrix(t: torch.Tensor,
+                          max_rows=PRINT_MAX_ROWS,
+                          max_cols=PRINT_MAX_COLS,
+                          decimals=PRINT_DECIMALS) -> str:
+    arr = t.detach().cpu().to(torch.float32).numpy()
+
+    def clip_rows(a, k):
+        if a.shape[0] <= k:
+            return a, False
+        half = k // 2
+        head = a[:half]
+        tail = a[-(k - half):]
+        return (np.vstack([head, tail])), True
+
+    def clip_cols(a, k):
+        if a.shape[1] <= k:
+            return a, False
+        half = k // 2
+        left = a[:, :half]
+        right = a[:, -(k - half):]
+        return np.hstack([left, right]), True
+
+    clipped = arr
+    row_ellipsis = False
+    col_ellipsis = False
+
+    if arr.ndim == 1:
+        clipped = arr.reshape(1, -1)
+        clipped, col_ellipsis = clip_cols(clipped, max_cols)
+    elif arr.ndim == 2:
+        clipped, row_ellipsis = clip_rows(clipped, max_rows)
+        clipped, col_ellipsis = clip_cols(clipped, max_cols)
+    else:
+        flat = arr.reshape(1, -1)
+        clipped, col_ellipsis = clip_cols(flat, max_cols)
+
+    with np.printoptions(precision=decimals, suppress=True):
+        body = np.array2string(clipped, separator=' ', max_line_width=180)
+
+    suffix = []
+    if row_ellipsis: suffix.append("행 … 생략")
+    if col_ellipsis: suffix.append("열 … 생략")
+    suffix_txt = f" ({', '.join(suffix)})" if suffix else ""
+
+    header = f"[shape: {arr.shape}] 요약표{suffix_txt}"
+    return header + "\n" + body
+
+def save_csv(t: torch.Tensor, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    a = t.detach().cpu().to(torch.float32).numpy()
+    if a.ndim == 1:
+        a = a.reshape(1, -1)
+    np.savetxt(path, a, delimiter=",", fmt="%.6f")
+
+def count_params(model):
+    return sum(p.numel() for p in model.parameters())
+
+# -------------------- 모델들 --------------------
+class BaselineMLP(nn.Module):
+    def __init__(self, hidden=256):
+        super().__init__()
+        self.fc1 = nn.Linear(784, hidden)
+        self.fc2 = nn.Linear(hidden, 10)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)      # [B, 784]
+        x = F.relu(self.fc1(x))        # [B, 256]
+        x = self.fc2(x)                # [B, 10]
+        return x
+
+class DynamicGateLinear(nn.Module):
+    """
+    y = x @ (W ⊙ G_hard)^T + b
+    - gate_logit (same shape as W): 학습 파라미터
+    - G_prob = sigmoid(gate_logit) (CSV로 저장)
+    - forward에서는 hard gate(>tau) + STE로 미분
+    """
+    def __init__(self, in_features, out_features, tau=0.3):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.linear = nn.Linear(in_features, out_features)
+        # 게이트 파라미터: W와 동일 shape
+        self.gate_logit = nn.Parameter(torch.zeros(out_features, in_features))
+        nn.init.normal_(self.gate_logit, mean=0.0, std=0.02)  # 초기값 살짝 노이즈
+        self.tau = tau
+
+    def forward(self, x):
+        W = self.linear.weight
+        b = self.linear.bias
+
+        G_prob = torch.sigmoid(self.gate_logit)          # [out, in]
+        # hard gate with STE
+        G_hard = (G_prob > self.tau).float()
+        G = G_hard + (G_prob - G_prob.detach())          # STE: grad는 prob로 흘림
+
+        W_eff = W * G                                    # [out, in]
+        # y = x @ W_eff^T + b
+        y = F.linear(x, W_eff, b)
+        # 부가 정보 반환 (로스 계산/로깅 용)
+        return y, G_prob, G_hard
+
+class DynamicGateMLP(nn.Module):
+    def __init__(self, hidden=256, tau=0.3):
+        super().__init__()
+        self.fc1 = DynamicGateLinear(784, hidden, tau=tau)
+        self.fc2 = DynamicGateLinear(hidden, 10,  tau=tau)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)          # [B, 784]
+        h, G1_prob, G1_hard = self.fc1(x)  # [B, hidden]
+        h = F.relu(h)
+        y, G2_prob, G2_hard = self.fc2(h)  # [B, 10]
+        aux = {
+            "G1_prob": G1_prob, "G1_hard": G1_hard,
+            "G2_prob": G2_prob, "G2_hard": G2_hard,
+        }
+        return y, aux
+
+# -------------------- 데이터 --------------------
+set_seed(SEED)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.1307,), (0.3081,))
+])
+train_ds = datasets.MNIST(root="./data", train=True,  download=True, transform=transform)
+test_ds  = datasets.MNIST(root="./data", train=False, download=True, transform=transform)
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=2, pin_memory=True)
+test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+
+# -------------------- 저장/출력 헬퍼 --------------------
+def dump_baseline(model: BaselineMLP, base_dir: Path, epoch: int):
+    outdir = base_dir / f"epoch_{epoch:02d}"
+    save_csv(model.fc1.weight, outdir / "fc1_weight.csv")
+    save_csv(model.fc1.bias,   outdir / "fc1_bias.csv")
+    save_csv(model.fc2.weight, outdir / "fc2_weight.csv")
+    save_csv(model.fc2.bias,   outdir / "fc2_bias.csv")
+
+    print("\n[Baseline] fc1.weight")
+    print(tensor_to_text_matrix(model.fc1.weight))
+    print("\n[Baseline] fc1.bias")
+    print(tensor_to_text_matrix(model.fc1.bias))
+    print("\n[Baseline] fc2.weight")
+    print(tensor_to_text_matrix(model.fc2.weight))
+    print("\n[Baseline] fc2.bias")
+    print(tensor_to_text_matrix(model.fc2.bias))
+    print(f"[저장 완료] {outdir.resolve()}")
+
+def dump_dgmlp(model: DynamicGateMLP, base_dir: Path, epoch: int, aux_last=None):
+    outdir = base_dir / f"epoch_{epoch:02d}"
+    # weights/bias
+    save_csv(model.fc1.linear.weight, outdir / "fc1_weight.csv")
+    save_csv(model.fc1.linear.bias,   outdir / "fc1_bias.csv")
+    save_csv(model.fc2.linear.weight, outdir / "fc2_weight.csv")
+    save_csv(model.fc2.linear.bias,   outdir / "fc2_bias.csv")
+    # gates (prob & hard)
+    G1_prob = torch.sigmoid(model.fc1.gate_logit)
+    G2_prob = torch.sigmoid(model.fc2.gate_logit)
+    save_csv(G1_prob, outdir / "fc1_gate_prob.csv")
+    save_csv(G2_prob, outdir / "fc2_gate_prob.csv")
+
+    if aux_last is not None:
+        save_csv(aux_last["G1_hard"], outdir / "fc1_gate_hard.csv")
+        save_csv(aux_last["G2_hard"], outdir / "fc2_gate_hard.csv")
+    else:
+        # no forward yet in this epoch
+        save_csv((G1_prob > TAU).float(), outdir / "fc1_gate_hard.csv")
+        save_csv((G2_prob > TAU).float(), outdir / "fc2_gate_hard.csv")
+
+    print("\n[DG-MLP] fc1.weight")
+    print(tensor_to_text_matrix(model.fc1.linear.weight))
+    print("\n[DG-MLP] fc1.gate_prob")
+    print(tensor_to_text_matrix(G1_prob))
+    print("\n[DG-MLP] fc2.weight")
+    print(tensor_to_text_matrix(model.fc2.linear.weight))
+    print("\n[DG-MLP] fc2.gate_prob")
+    print(tensor_to_text_matrix(G2_prob))
+    print(f"[저장 완료] {outdir.resolve()}")
+
+def eval_accuracy(model, loader, is_dg=False):
+    model.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for imgs, labels in loader:
+            imgs, labels = imgs.to(device), labels.to(device)
+            if is_dg:
+                logits, _ = model(imgs)
+            else:
+                logits = model(imgs)
+            pred = logits.argmax(dim=1)
+            correct += (pred == labels).sum().item()
+            total += imgs.size(0)
+    return correct / total
+
+# -------------------- 학습 루틴 --------------------
+def train_baseline():
+    model = BaselineMLP(hidden=HIDDEN).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
+    criterion = nn.CrossEntropyLoss()
+
+    base_dir = SAVE_DIR / "BASELINE"
+    hist = []
+    # 초기 덤프(가중치 미리보기)
+    dump_baseline(model, base_dir, epoch=0)
+
+    for epoch in range(1, EPOCHS+1):
+        model.train()
+        running, total, correct = 0.0, 0, 0
+        for imgs, labels in train_loader:
+            imgs, labels = imgs.to(device), labels.to(device)
+            logits = model(imgs)
+            loss = criterion(logits, labels)
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            running += loss.item() * imgs.size(0)
+            pred = logits.argmax(1)
+            correct += (pred == labels).sum().item()
+            total += imgs.size(0)
+
+        train_loss = running / total
+        train_acc  = correct / total
+        test_acc   = eval_accuracy(model, test_loader, is_dg=False)
+
+        print(f"\n[BASELINE][Epoch {epoch}/{EPOCHS}] "
+              f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} test_acc={test_acc:.4f}")
+
+        dump_baseline(model, base_dir, epoch=epoch)
+        hist.append({"epoch": epoch, "train_loss": train_loss, "train_acc": train_acc, "test_acc": test_acc})
+
+    return model, pd.DataFrame(hist)
+
+def train_dgmlp():
+    model = DynamicGateMLP(hidden=HIDDEN, tau=TAU).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
+    criterion = nn.CrossEntropyLoss()
+
+    base_dir = SAVE_DIR / "DGMLP"
+    hist = []
+    # 초기 덤프
+    dump_dgmlp(model, base_dir, epoch=0)
+
+    for epoch in range(1, EPOCHS+1):
+        model.train()
+        running, total, correct = 0.0, 0, 0
+        aux_last = None
+
+        for imgs, labels in train_loader:
+            imgs, labels = imgs.to(device), labels.to(device)
+            logits, aux = model(imgs)
+            aux_last = aux  # 마지막 배치의 게이트 하드 스냅샷용
+
+            ce = criterion(logits, labels)
+            # sparsity regularization on G_prob
+            G1_prob, G2_prob = aux["G1_prob"], aux["G2_prob"]
+            gate_l1 = (G1_prob.mean() + G2_prob.mean())  # 평균값이 작아질수록 더 sparse
+            loss = ce + GATE_BETA * gate_l1
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            running += ce.item() * imgs.size(0)
+            pred = logits.argmax(1)
+            correct += (pred == labels).sum().item()
+            total += imgs.size(0)
+
+        train_loss = running / total
+        train_acc  = correct / total
+        test_acc   = eval_accuracy(model, test_loader, is_dg=True)
+
+        print(f"\n[DG-MLP][Epoch {epoch}/{EPOCHS}] "
+              f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} test_acc={test_acc:.4f} "
+              f"(gate_l1≈{gate_l1.item():.4f})")
+
+        dump_dgmlp(model, base_dir, epoch=epoch, aux_last=aux_last)
+        hist.append({"epoch": epoch, "train_loss": train_loss, "train_acc": train_acc, "test_acc": test_acc,
+                     "gate_l1": gate_l1.item()})
+
+    return model, pd.DataFrame(hist)
+
+# -------------------- 실행 --------------------
+baseline_model, baseline_hist = train_baseline()
+dg_model,       dg_hist       = train_dgmlp()
+
+# -------------------- 비교 리포트 --------------------
+def active_ratio_from_gates(model: DynamicGateMLP, tau=TAU):
+    with torch.no_grad():
+        g1 = (torch.sigmoid(model.fc1.gate_logit) > tau).float()
+        g2 = (torch.sigmoid(model.fc2.gate_logit) > tau).float()
+        active = g1.sum().item() + g2.sum().item()
+        total  = g1.numel() + g2.numel()
+        return active / total, int(active), int(total)
+
+baseline_params = count_params(baseline_model)
+dg_params       = count_params(dg_model)
+dg_active_ratio, dg_active, dg_total = active_ratio_from_gates(dg_model, tau=TAU)
+
+summary = pd.DataFrame([
+    {
+        "Model": "Baseline",
+        "Params": baseline_params,
+        "Final Test Acc": baseline_hist["test_acc"].iloc[-1],
+        "Gates Active Ratio": None,
+        "Gates Active (/#total)": None
+    },
+    {
+        "Model": "DynamicGate-MLP",
+        "Params": dg_params,
+        "Final Test Acc": dg_hist["test_acc"].iloc[-1],
+        "Gates Active Ratio": dg_active_ratio,
+        "Gates Active (/#total)": f"{dg_active}/{dg_total}"
+    }
+])
+
+print("\n===== 최종 비교표 =====")
+print(summary.to_string(index=False))
+
+print("\n[참고]")
+print(f"- 저장 루트: {SAVE_DIR.resolve()}")
+print("- BASELINE: 각 epoch의 fc1/fc2 weight/bias CSV")
+print("- DGMLP   : 각 epoch의 fc1/fc2 weight/bias + gate_prob + gate_hard CSV")
+print("- 콘솔에는 요약표(일부만) 출력, CSV에는 전체 행렬 저장")
