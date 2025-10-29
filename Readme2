@@ -1,0 +1,19 @@
+Baseline MLP (표준 Linear) 와
+
+DynamicGate-MLP (가중치와 동일 shape의 게이트 행렬을 학습, τ(threshold) + STE 사용)
+
+두 모델을 같은 학습 루프로 훈련하고,
+
+각 epoch마다 weight / bias 저장,
+
+DynamicGate-MLP의 gate 행렬(확률/하드) 을 행렬 텍스트 요약 출력 + CSV 전체 저장,
+
+두 모델의 수치 비교표(정확도, 파라미터 수, 활성 가중치 비율 등) 를 출력합니다.
+
+게이트는 W ⊙ G(동일 shape)로 적용합니다.
+G_prob = sigmoid(gate_logit)을 저장하며, forward에서는 τ 기준의 hard gate(STE)로 연산합니다.
+
+폴더 구조:
+/content/mnist_compare/BASELINE/epoch_xx/*.csv,
+/content/mnist_compare/DGMLP/epoch_xx/*.csv 로 저장됩니다.
+(Drive에 보존하려면 SAVE_DIR 경로를 /content/drive/MyDrive/...로 바꾸세요.)
