@@ -1,0 +1,27 @@
+Baseline MLP vs DynamicGate-MLP Summary
+
+> 구현 메모 (요점 정리)
+
+•  게이트 위치/형태: 가중치와 동일한 shape의 행렬 G∈R^("out" ×"in" )을 학습하고, forward에서 W_"eff" =W⊙G_"hard" 로 사용합니다.
+
+	- 학습은 STE로 G_"hard" 의 binary threshold 연산을 미분 가능하게 근사합니다.
+	- 저장은 G_prob = sigmoid(gate_logit)(0~1 확률)과 G_hard(0/1)의 둘 다 CSV로 남깁니다.
+
+•  희소화 규제: gate_l1 = (G1_prob.mean()+G2_prob.mean())에 GATE_BETA를 곱해 손실에 더해, 평균 게이트 확률을 낮추도록 유도(연결 줄이기).	​
+
+
+> 비교지표:
+
+- 두 모델 파라미터 수(정의 상 동일하나 DG-MLP는 실질적으로 비활성 연결이 생김),
+
+- DG-MLP의 active gate 비율(τ 초과한 연결 개수/전체 연결),
+
+- 최종 테스트 정확도를 테이블로 요약.
+
+•  CSV 저장물(DG-MLP):
+
+- fc*_weight.csv, fc*_bias.csv
+
+- fc*_gate_prob.csv (연속값)
+
+- fc*_gate_hard.csv (0/1)
