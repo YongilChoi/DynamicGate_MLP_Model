@@ -1,0 +1,34 @@
+# DynamicGate-MLP: A Gated MLP with Learnable Activation Control
+> Open Research Project by Yongil Choi (2025)
+
+---
+
+### 📘 Overview
+DynamicGate-MLP introduces a learnable gating mechanism on each linear layer, 
+allowing dynamic activation and sparsity control during training.  
+This approach aims to bridge static MLPs and adaptive computation networks, 
+providing a new view on pruning and dropout regularization.
+
+---
+
+### ⚖️ License
+This repository is shared under the **Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)** license.
+
+You are free to:
+- Share — copy and redistribute the material in any medium or format  
+- Adapt — remix, transform, and build upon the material  
+
+Under the following terms:
+- **Attribution** — You must give appropriate credit, link to this repository, and indicate if changes were made.  
+- **NonCommercial** — You may not use the material for commercial purposes.  
+- **ShareAlike** — If you remix, transform, or build upon the material, you must distribute your contributions under the same license.
+
+For any **commercial or research partnership inquiries**, please contact:
+📧 hurstchoi@sorynory.com 
+🌐 [https://github.com/YongilChoi/DynamicGate_MLP_Model](https://github.com/YongilChoi/DynamicGate_MLP_Model)
+
+---
+
+### 🧠 Citation
+If you build on this work, please cite or link back to this repository:
+
