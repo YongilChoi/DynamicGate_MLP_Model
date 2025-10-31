@@ -33,6 +33,14 @@ For any **commercial or research partnership inquiries**, please contact:
 If you build on this work, please cite or link back to this repository:
 
 ---
+@misc{YongilChoidynamicgate,
+title = {DynamicGate-MLP: A Gated MLP with Learnable Activation Control},
+author = {Yong il Choi (Open Research Lab)},
+year = {2025},
+url = {https://github.com/YongilChoi/DynamicGate_MLP_Model}  
+,
+note = {Shared under CC BY-NC-SA 4.0}
+}
 
 ### 🙏 Acknowledgment
 This open research is dedicated to all independent researchers 
