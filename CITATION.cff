@@ -1,0 +1,20 @@
+# 파일명: CITATION.cff
+cff-version: 1.2.0
+message: "If you use this work, please cite it as below."
+title: "DynamicGate-MLP: A Gated MLP with Learnable Activation Control"
+authors:
+  - family-names: Choi
+    given-names: Yong il
+    affiliation: "Open Research Lab"
+date-released: 2025-10-31
+version: "1.0.0"
+license: "CC-BY-NC-SA-4.0"
+url: "https://github.com/YongilChoi/DynamicGate_MLP_Model/"
+preferred-citation:
+  type: misc
+  title: "DynamicGate-MLP: A Gated MLP with Learnable Activation Control"
+  author:
+    - name: "Yongil Choi (Open Research Lab)"
+  year: 2025
+  url: "https://github.com/YongilChoi/DynamicGate_MLP_Model"
+  note: "Shared under CC BY-NC-SA 4.0"
