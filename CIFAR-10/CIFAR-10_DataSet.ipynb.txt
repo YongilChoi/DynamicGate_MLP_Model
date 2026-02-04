@@ -1,0 +1,498 @@
+## Paper : Souce code for Speech Commands dataset 
+# this code is verified on Colab 
+
+# author : 2026. 2. 4 by Yong il Choi / 
+# Open Reseach Lab of Sorynorydotcom Co,. Ltd. 
+
+# Dynamicgate MLP only version
+
+
+# %% [markdown]
+
+# 논문 5.2 CIFAR-10 
+# 해당 아래 코드임. 
+
+# # CIFAR-10 / CIFAR-100: Baseline / Dropout / Pruned / Gate-MLP 비교 실험 (Colab-ready)
+# - 데이터셋: CIFAR-10 또는 CIFAR-100 (Krizhevsky, 2009)
+# - 한 번에 학습/평가/시각화
+# - FLOPs는 FC(MAC) 기준 "상대 비교치"
+# - Gate-MLP: 하드 게이트 + STE, 규제 λ_g * sum(p), τ 에닐링
+
+# %% [code]
+import os, math, time, copy, random
+import numpy as np
+import torch, torch.nn as nn, torch.nn.functional as F, torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from torch.nn.utils import prune
+import matplotlib.pyplot as plt
+
+# -----------------------------
+# 0) 환경/시드
+# -----------------------------
+SEED = 52
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+torch.backends.cudnn.deterministic = False
+torch.backends.cudnn.benchmark = True
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+# -----------------------------
+# 1) 실험 설정
+# -----------------------------
+DATASET = "cifar10"   # "cifar10" or "cifar100"
+
+EPOCHS_BASE = 15      # Baseline/Dropout 에폭 (Colab에서 적당히)
+EPOCHS_PRUNE_FT = 8   # Pruned 미세튜닝 에폭
+EPOCHS_GATE = 15      # Gate-MLP 에폭
+
+BATCH_SIZE = 128
+LR = 1e-3
+WEIGHT_DECAY = 1e-4
+
+# -----------------------------
+# 추가: 학습 안정화/공정 비교용
+# -----------------------------
+EPOCHS_TOTAL = EPOCHS_BASE          # (선택) baseline과 비교 시 총 epoch 맞추기용
+
+
+# (추천) CIFAR 입력 정규화/약한 증강을 켜는 옵션(코드 쪽에서 사용)
+USE_CIFAR_NORM = True
+USE_AUGMENT = True   # random crop/flip 정도
+
+# -----------------------------
+# 추가: Dropout 세팅 (너무 크면 성능 꺾임)
+# -----------------------------
+DROPOUT_P = 0.1  # 0.5는 이 세팅(약한 MLP/짧은 학습)에선 underfitting 날 가능성 큼
+
+# -----------------------------
+# 추가: Gate-MLP 세팅 (핵심)
+# -----------------------------
+GATE_WARMUP_EPOCHS = 3   #5 : Base랑 똑같음    # 초반엔 gate 규제 거의 없이 본체 먼저 학습
+TAU_START = 2.0
+TAU_END   = 1.2             # 0.7까지 내리면 너무 hard해져서 다 닫히기 쉬움(특히 CIFAR)
+GATE_LAMBDA_START = 0.0
+GATE_LAMBDA_END   = 2e-2    # 1e-5 # (중요) 1e-3 수준이면 “닫아라” 압력이 너무 큼
+
+# 목표 open-rate를 유도(붕괴 방지용)
+OPEN_TARGET_L1 = 0.52 # 0.60   # 0.40 Base랑 똑같음.
+OPEN_TARGET_L2 = 0.35 # 0.40   # 0.30 Base랑 똑같음.
+OPEN_TARGET_WEIGHT = 0.8  # 0.5 # 1.0 Base랑 똑같음     # (mean(p)-target)^2 같은 보조항에 곱
+
+# open-rate 계산/추론에서 너무 빡빡하면 threshold를 낮추기
+GATE_THRESHOLD = 0.5     #0.2    # 0.5는 닫힘이 심할 때가 많음
+GATE_P0 = 0.65
+
+
+
+# 모델 골격 (공통: MLP)
+INPUT_DIM = 32 * 32 * 3
+HID1, HID2 = 1024, 512
+NUM_CLASSES = 10 if DATASET.lower() == "cifar10" else 100
+
+# -----------------------------
+# 2) 데이터 로더 (CIFAR-10 / CIFAR-100)
+# -----------------------------
+if DATASET.lower() == "cifar10":
+    mean = (0.4914, 0.4822, 0.4465)
+    std  = (0.2023, 0.1994, 0.2010)
+    DS = datasets.CIFAR10
+elif DATASET.lower() == "cifar100":
+    mean = (0.5071, 0.4867, 0.4408)
+    std  = (0.2675, 0.2565, 0.2761)
+    DS = datasets.CIFAR100
+else:
+    raise ValueError("DATASET must be 'cifar10' or 'cifar100'")
+
+train_tf = transforms.Compose([
+    transforms.RandomCrop(32, padding=4),     # <<< USE_AUGMENT 무시 (항상 적용)
+    transforms.RandomHorizontalFlip(),        # <<< USE_AUGMENT 무시 (항상 적용)
+    transforms.ToTensor(),
+    transforms.Normalize(mean, std),          # <<< USE_CIFAR_NORM 무시 (항상 적용)
+])
+
+test_tf = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean, std),
+])
+
+train_ds = DS(root="./data", train=True, download=True, transform=train_tf)
+test_ds  = DS(root="./data", train=False, download=True, transform=test_tf)
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=2, pin_memory=True)
+test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+
+print(f"Dataset: {DATASET.upper()} | Train: {len(train_ds)} | Test: {len(test_ds)} | Classes: {NUM_CLASSES}")
+
+# -----------------------------
+# 3) 유틸: 학습/평가
+# -----------------------------
+@torch.no_grad()
+def accuracy(model, loader):
+    model.eval()
+    correct, total = 0, 0
+    for x,y in loader:
+        x,y = x.to(device), y.to(device)
+        x = x.view(x.size(0), -1)
+        logits = model(x)
+        pred = logits.argmax(dim=1)
+        correct += (pred==y).sum().item()
+        total += y.size(0)
+    return 100.0 * correct / total
+
+def train_simple(model, loader, epochs, lr=LR, desc="train"):
+    model.to(device)
+    opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
+    criterion = nn.CrossEntropyLoss()
+    for ep in range(1, epochs+1):
+        model.train()
+        total_loss = 0.0
+        for x,y in loader:
+            x,y = x.to(device), y.to(device)
+            x = x.view(x.size(0), -1)
+            opt.zero_grad(set_to_none=True)
+            logits = model(x)
+            loss = criterion(logits, y)
+            loss.backward()
+            opt.step()
+            total_loss += loss.item() * x.size(0)
+        print(f"[{desc}] epoch {ep:02d}/{epochs} - loss: {total_loss/len(loader.dataset):.4f}")
+
+# FLOPs(상대치) 계산: FC 레이어 MAC 기준
+def fc_macs(in_features, out_features):  # bias 제외
+    return int(in_features) * int(out_features)
+
+def dense_mlp_flops():
+    return (
+        fc_macs(INPUT_DIM, HID1) +
+        fc_macs(HID1, HID2) +
+        fc_macs(HID2, NUM_CLASSES)
+    )
+
+BASELINE_FLOPS = dense_mlp_flops()
+
+# -----------------------------
+# 4) 1) Baseline MLP
+# -----------------------------
+class MLP(nn.Module):
+    def __init__(self, dropout_p=0.0):
+        super().__init__()
+        self.fc1 = nn.Linear(INPUT_DIM, HID1)
+        self.fc2 = nn.Linear(HID1, HID2)
+        self.fc3 = nn.Linear(HID2, NUM_CLASSES)
+        self.do1 = nn.Dropout(dropout_p) if dropout_p>0 else nn.Identity()
+        self.do2 = nn.Dropout(dropout_p) if dropout_p>0 else nn.Identity()
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = self.do1(x)
+        x = F.relu(self.fc2(x))
+        x = self.do2(x)
+        x = self.fc3(x)
+        return x
+
+baseline = MLP().to(device)
+train_simple(baseline, train_loader, EPOCHS_BASE, desc="Baseline")
+acc_base = accuracy(baseline, test_loader)
+flops_base_rel = 1.0
+print(f"Baseline Acc: {acc_base:.2f}%, FLOPs(rel): {flops_base_rel:.2f}")
+
+# -----------------------------
+# 5) 2) Dropout MLP (추론은 dense)
+# -----------------------------
+dropout = MLP(dropout_p=DROPOUT_P).to(device)
+train_simple(dropout, train_loader, EPOCHS_BASE, desc="Dropout")
+acc_do = accuracy(dropout, test_loader)
+flops_do_rel = 1.0  # 추론 시 드롭아웃 OFF → dense
+print(f"Dropout Acc: {acc_do:.2f}%, FLOPs(rel): {flops_do_rel:.2f}")
+
+# -----------------------------
+# 6) 3) Pruned MLP: 글로벌 프루닝 + 미세튜닝
+# -----------------------------
+pruned = copy.deepcopy(baseline).to(device)
+
+PRUNE_AMOUNT = 0.4  # 40% prune
+prune.global_unstructured(
+    parameters=[
+        (pruned.fc1, "weight"),
+        (pruned.fc2, "weight"),
+        (pruned.fc3, "weight"),
+    ],
+    pruning_method=prune.L1Unstructured,
+    amount=PRUNE_AMOUNT
+)
+
+# 마스크 영구 적용(remove) 후 미세튜닝
+for layer in [pruned.fc1, pruned.fc2, pruned.fc3]:
+    prune.remove(layer, "weight")
+
+train_simple(pruned, train_loader, EPOCHS_PRUNE_FT, lr=LR*0.5, desc="Pruned-FT")
+acc_pruned = accuracy(pruned, test_loader)
+
+# 프루닝 후 FLOPs(상대) 추정: 남은 가중치 비율로 근사
+def nonzero_ratio_linear(linear):
+    w = linear.weight.detach()
+    nz = (w != 0).sum().item()
+    total = w.numel()
+    return nz / total
+
+r1 = nonzero_ratio_linear(pruned.fc1)
+r2 = nonzero_ratio_linear(pruned.fc2)
+r3 = nonzero_ratio_linear(pruned.fc3)
+
+flops_pruned = (
+    r1 * fc_macs(INPUT_DIM, HID1) +
+    r2 * fc_macs(HID1, HID2) +
+    r3 * fc_macs(HID2, NUM_CLASSES)
+)
+flops_pruned_rel = flops_pruned / BASELINE_FLOPS
+print(f"Pruned Acc: {acc_pruned:.2f}%, FLOPs(rel): {flops_pruned_rel:.2f}")
+
+# -----------------------------
+# 7) 4) Gate-MLP (하드 게이트 + STE)
+# -----------------------------
+class GateSTEFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits, tau, thr):
+        p = torch.sigmoid(logits / tau)
+        g = (p > thr).float()
+        ctx.save_for_backward(p, torch.tensor(float(tau), dtype=logits.dtype, device=logits.device))
+        return g
+    @staticmethod
+    def backward(ctx, grad_out):
+        p, tau = ctx.saved_tensors
+        grad_logits = grad_out * (p * (1 - p)) / tau
+        return grad_logits, None, None
+
+class GatedLinear(nn.Module):
+    def __init__(self, in_f, out_f, tau=2.0, thr=0.5, p0=0.8):
+        super().__init__()
+        self.fc = nn.Linear(in_f, out_f)
+        z0 = torch.logit(torch.tensor(p0))
+        self.logits = nn.Parameter(torch.full((out_f,), float(z0)))
+        self.tau = tau
+        self.thr = thr
+    def forward(self, x, return_p=False):
+        h = self.fc(x)
+        g = GateSTEFn.apply(self.logits, self.tau, self.thr)  # (out_f,)
+        y = h * g
+        if return_p:
+            p = torch.sigmoid(self.logits / self.tau)
+            return y, p, g
+        return y
+
+class GateMLP(nn.Module):
+    def __init__(self, tau=2.0, thr=0.5, p0=0.8):
+        super().__init__()
+        self.g1 = GatedLinear(INPUT_DIM, HID1, tau=tau, thr=thr, p0=p0)
+        self.g2 = GatedLinear(HID1, HID2,    tau=tau, thr=thr, p0=p0)
+        self.fc3 = nn.Linear(HID2, NUM_CLASSES)
+    def forward(self, x, return_stats=False):
+        y1, p1, g1 = self.g1(x, return_p=True)
+        a1 = F.relu(y1)
+        y2, p2, g2 = self.g2(a1, return_p=True)
+        a2 = F.relu(y2)
+        out = self.fc3(a2)
+        if return_stats:
+            return out, (p1, p2), (g1, g2)
+        return out
+
+# def train_gate(model, loader, epochs, lr=LR, lambda_g=2e-3,
+#                tau_hi=2.0, tau_lo=0.7, tau_anneal_portion=0.7):
+#     model.to(device)
+#     opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
+#     criterion = nn.CrossEntropyLoss()
+
+#     for ep in range(1, epochs+1):
+#         # tau 에닐링
+#         t = min(1.0, ep / max(1, int(epochs * tau_anneal_portion)))
+#         tau_now = tau_hi + (tau_lo - tau_hi) * t
+#         model.g1.tau = model.g2.tau = tau_now
+
+#         model.train()
+#         total_loss, mean_p = 0.0, []
+#         for x,y in loader:
+#             x,y = x.to(device), y.to(device)
+#             x = x.view(x.size(0), -1)
+
+#             opt.zero_grad(set_to_none=True)
+#             logits, (p1,p2), _ = model(x, return_stats=True)
+
+#             task_loss = criterion(logits, y)
+#            #  reg_loss  = lambda_g * (p1.sum() + p2.sum())  # <== 붕괴 핵심
+#             reg_loss = lambda_g * (p1.mean() + p2.mean())   # <<< sum() 대신 mean()
+#             loss = task_loss + reg_loss
+
+#             loss.backward()
+#             torch.nn.utils.clip_grad_norm_([model.g1.logits, model.g2.logits], max_norm=1.0)
+#             opt.step()
+
+#             total_loss += loss.item() * x.size(0)
+#             mean_p.append(torch.cat([p1, p2]).mean().item())
+
+#         print(f"[Gate-MLP] epoch {ep:02d}/{epochs} - loss: {total_loss/len(loader.dataset):.4f} - tau:{tau_now:.2f} - mean(p): {np.mean(mean_p):.3f}")
+
+def train_gate(model, loader, epochs, lr=LR,
+               lambda_start=0.0, lambda_end=2e-2,
+               warmup_epochs=3,
+               tau_hi=2.0, tau_lo=1.2, tau_anneal_portion=0.7,
+               target1=0.60, target2=0.40, target_w=0.5):
+    model.to(device)
+    opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
+    criterion = nn.CrossEntropyLoss()
+
+    for ep in range(1, epochs+1):
+        # tau anneal
+        t = min(1.0, ep / max(1, int(epochs * tau_anneal_portion)))
+        tau_now = tau_hi + (tau_lo - tau_hi) * t
+        model.g1.tau = model.g2.tau = tau_now
+
+        # lambda schedule (warmup 이후 선형 증가)
+        if ep <= warmup_epochs:
+            lambda_now = 0.0
+        else:
+            tt = (ep - warmup_epochs) / max(1, (epochs - warmup_epochs))
+            lambda_now = lambda_start + (lambda_end - lambda_start) * tt
+
+        model.train()
+        total_loss = 0.0
+        mean_p1s, mean_p2s, or1s, or2s = [], [], [], []
+
+        for x,y in loader:
+            x,y = x.to(device), y.to(device)
+            x = x.view(x.size(0), -1)
+
+            opt.zero_grad(set_to_none=True)
+            logits, (p1,p2), _ = model(x, return_stats=True)
+
+            task_loss = criterion(logits, y)
+
+            # (중요) sum -> mean 으로 스케일 안정화
+            sparsity_loss = lambda_now * (p1.mean() + p2.mean())
+
+            # target open-rate 유도(너무 열림/닫힘 방지)
+            target_loss = target_w * ((p1.mean() - target1)**2 + (p2.mean() - target2)**2)
+
+            loss = task_loss + sparsity_loss + target_loss
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_([model.g1.logits, model.g2.logits], max_norm=1.0)
+            opt.step()
+
+            total_loss += loss.item() * x.size(0)
+
+            mp1 = p1.mean().item(); mp2 = p2.mean().item()
+            mean_p1s.append(mp1); mean_p2s.append(mp2)
+
+            # 현재 thr 기준 open-rate 모니터링
+            thr = model.g1.thr
+            or1s.append((p1.detach() > thr).float().mean().item())
+            or2s.append((p2.detach() > thr).float().mean().item())
+
+        print(f"[Gate-MLP] epoch {ep:02d}/{epochs} - loss: {total_loss/len(loader.dataset):.4f} "
+              f"- tau:{tau_now:.2f} - lam:{lambda_now:.4g} "
+              f"- mean(p1/p2): {np.mean(mean_p1s):.3f}/{np.mean(mean_p2s):.3f} "
+              f"- OR1/OR2: {np.mean(or1s):.2f}/{np.mean(or2s):.2f}")
+
+
+@torch.no_grad()
+def eval_gate(model, loader, thr=0.5):
+    model.eval()
+    correct, total = 0, 0
+    ps_all = []
+    for x,y in loader:
+        x,y = x.to(device), y.to(device)
+        x = x.view(x.size(0), -1)
+        logits, (p1,p2), _ = model(x, return_stats=True)
+        pred = logits.argmax(dim=1)
+        correct += (pred==y).sum().item()
+        total += y.size(0)
+        ps_all.append(torch.cat([p1, p2]).detach().cpu().numpy())
+
+    acc = 100.0 * correct / total
+    ps  = np.concatenate(ps_all, axis=0)
+
+    # FLOPs 추정(하드마스크 기준): 레이어별 열린 뉴런 수로 근사
+    p1 = torch.sigmoid(model.g1.logits / model.g1.tau).detach().cpu().numpy()
+    p2 = torch.sigmoid(model.g2.logits / model.g2.tau).detach().cpu().numpy()
+    g1_mask = (p1 > thr).astype(np.float32)
+    g2_mask = (p2 > thr).astype(np.float32)
+
+    on1 = g1_mask.sum()
+    on2 = g2_mask.sum()
+
+    flops = fc_macs(INPUT_DIM, on1) + fc_macs(on1, on2) + fc_macs(on2, NUM_CLASSES)
+    flops_rel = flops / BASELINE_FLOPS
+
+    open_rate1 = on1 / HID1
+    open_rate2 = on2 / HID2
+
+    return acc, flops_rel, ps, (open_rate1, open_rate2)
+
+# gate = GateMLP(tau=2.0, thr=0.5, p0=0.8).to(device)
+# gate = GateMLP(tau=TAU_START, thr=GATE_THRESHOLD, p0=0.8).to(device)
+gate = GateMLP(tau=TAU_START, thr=GATE_THRESHOLD, p0=GATE_P0).to(device)
+
+
+# train_gate(gate, train_loader, EPOCHS_GATE, lambda_g=2e-3)
+# train_gate(
+#     gate, train_loader, EPOCHS_GATE,
+#     lambda_g=GATE_LAMBDA_END,
+#     tau_hi=TAU_START, tau_lo=TAU_END
+# )
+train_gate(
+    gate, train_loader, EPOCHS_GATE,
+    lambda_start=GATE_LAMBDA_START, lambda_end=GATE_LAMBDA_END,
+    warmup_epochs=GATE_WARMUP_EPOCHS,
+    tau_hi=TAU_START, tau_lo=TAU_END,
+    target1=OPEN_TARGET_L1, target2=OPEN_TARGET_L2,
+    target_w=OPEN_TARGET_WEIGHT
+)
+
+# acc_gate, flops_gate_rel, ps_gate, (or1, or2) = eval_gate(gate, test_loader, thr=0.5)
+# acc_gate, flops_gate_rel, ps_gate, (or1, or2) = eval_gate(gate, test_loader, thr=GATE_THRESHOLD)
+acc_gate, flops_gate_rel, ps_gate, (or1, or2) = eval_gate(gate, test_loader, thr=GATE_THRESHOLD)
+
+
+print(f"Gate-MLP Acc: {acc_gate:.2f}%, FLOPs(rel): {flops_gate_rel:.2f}, OpenRate L1/L2: {or1:.2f}/{or2:.2f}")
+
+# -----------------------------
+# 8) 요약 & 시각화
+# -----------------------------
+results = [
+    ("Baseline", acc_base, flops_base_rel),
+    ("Dropout",  acc_do,   flops_do_rel),
+    ("Pruned",   acc_pruned, flops_pruned_rel),
+    ("Gate-MLP", acc_gate, flops_gate_rel),
+]
+
+print("\n=== Summary ===")
+for name,a,f in results:
+    print(f"{name:>9s} | Acc: {a:6.2f}% | FLOPs(rel): {f:6.3f}")
+
+names = [r[0] for r in results]
+accs  = [r[1] for r in results]
+flops = [r[2] for r in results]
+
+plt.figure(figsize=(9,3.8))
+plt.subplot(1,2,1)
+plt.title(f"{DATASET.upper()} Accuracy (%)")
+plt.bar(names, accs)
+plt.grid(axis='y')
+
+plt.subplot(1,2,2)
+plt.title("Relative FLOPs (↓ better)")
+plt.bar(names, flops)
+plt.ylim(0, 1.05)
+plt.grid(axis='y')
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(5.2,3.2))
+plt.hist(ps_gate, bins=30)
+plt.title("Gate probabilities p (all gated neurons)")
+plt.xlabel("p"); plt.ylabel("count")
+plt.tight_layout()
+plt.show()
+
+print(f"Gate open-rate (threshold=0.5): L1={or1*100:.1f}%, L2={or2*100:.1f}%")

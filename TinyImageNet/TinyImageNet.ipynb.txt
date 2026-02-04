@@ -1,0 +1,703 @@
+# Paper : Souce code for Tiny ImageNet dataset 
+# this code is verified on Colab 
+
+# author : 2026. 2. 4 by Yong il Choi / 
+# Open Reseach Lab of Sorynorydotcom Co,. Ltd. 
+
+
+# DynamicGate MLP와 RigL 을 결합한 버전
+
+
+# ============================================
+# DynamicGateRigL_MLP (Gate + RigL Rewire) - PRESET VERSION
+# Tiny ImageNet / Colab Friendly - Single Script
+#
+# Tiny ImageNet(200 classes, 64x64 RGB) 데이터셋 자동 다운로드 + val 폴더 정리 포함
+#
+# 비교 모델:
+# 1) Baseline MLP
+# 2) Dropout MLP
+# 3) Pruned MLP (MaskedLinear로 mask 유지)
+# 4) DynamicGateRigL_MLP (Gate + RigL)
+#
+# 핵심 반영:
+# 1) Gate STE: gates = probs + (hard - probs).detach()
+# 2) Gate 규제는 미분 가능하게: r_soft = probs.mean()
+# 3) Pruned baseline도 mask를 학습 내내 유지: MaskedLinear
+# 4) Eval에서도 min_keep 보장(붕괴 방지)
+# 5) RigL: prune&grow(grad EMA 기반) + mask 유지
+# ============================================
+
+import os
+import random
+import shutil
+import zipfile
+import urllib.request
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+import pandas as pd
+
+# -------------------- Preset Select --------------------
+# "balanced"  : 정확도 유지 + gate_hard 내려오기
+# "saving"    : FLOPs 절감 공격적(정확도 약간 희생 가능)
+# "scheduled" : 초반 안정 → 후반 gate 규제 강화(추천)
+# "more_acc"  : 정확도 우선(연산 약간 증가 허용)
+PRESET = "more_acc"
+
+# -------------------- Base Config --------------------
+seed = 42
+epochs = 20
+batch_size = 128
+lr = 1e-3
+hidden = 256
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Tiny ImageNet settings
+IMG_SIZE = 64
+NUM_CLASSES = 200
+IN_DIM = IMG_SIZE * IMG_SIZE * 3  # 64*64*RGB=12288
+
+# ✅ Dropout baseline
+dropout_p = 0.3  # 0.2~0.5 튜닝 가능
+
+# RigL (structural plasticity) — fc1에만 적용 기본
+rigl_sparsity = 0.80        # fc1 연결 중 80%를 0으로
+rigl_update_every = 200     # step 기준 prune/grow 주기
+rigl_grow_frac = 0.01       # 전체 연결 대비 재배선 비율
+ema_grad_alpha = 0.9        # grad EMA 계수
+apply_rigl_to_fc2 = False   # 기본 False (fc2는 dense 유지)
+
+# Pruned baseline
+prune_sparsity = 0.30       # 30% prune
+
+# Logging
+log_gate_batches = 8
+
+# -------------------- Gate Defaults (preset override) --------------------
+tau = 0.7
+min_keep = 0.10
+target_keep = 0.50
+gate_beta = 1e-2
+warmup_epochs = 2
+
+gate_beta_schedule = "none"   # "none" | "exp" | "linear"
+gate_beta_mult = 1.5
+gate_beta_max = 1e-1
+
+# -------------------- Presets --------------------
+if PRESET == "balanced":
+    tau = 0.7
+    min_keep = 0.10
+    target_keep = 0.50
+    gate_beta = 1e-2
+    warmup_epochs = 2
+    gate_beta_schedule = "none"
+
+elif PRESET == "saving":
+    tau = 0.8
+    min_keep = 0.05
+    target_keep = 0.30
+    gate_beta = 5e-2
+    warmup_epochs = 1
+    gate_beta_schedule = "none"
+
+elif PRESET == "scheduled":
+    tau = 0.7
+    min_keep = 0.10
+    target_keep = 0.50
+    gate_beta = 1e-3
+    warmup_epochs = 3
+    gate_beta_schedule = "exp"
+    gate_beta_mult = 1.5
+    gate_beta_max = 1e-1
+
+elif PRESET == "more_acc":
+    tau = 0.6
+    min_keep = 0.20
+    target_keep = 0.50
+    gate_beta = 1e-3
+    warmup_epochs = 3
+    gate_beta_schedule = "exp"
+    gate_beta_mult = 1.5
+    gate_beta_max = 1e-1
+
+else:
+    raise ValueError(f"Unknown PRESET={PRESET}")
+
+# -------------------- Repro --------------------
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+set_seed(seed)
+
+# -------------------- Tiny ImageNet Download/Prepare --------------------
+TINY_URL = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
+
+def download_tiny_imagenet(root="./data"):
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    zip_path = root / "tiny-imagenet-200.zip"
+    extract_path = root / "tiny-imagenet-200"
+
+    if extract_path.exists():
+        return str(extract_path)
+
+    if not zip_path.exists():
+        print(f"[Download] Tiny ImageNet -> {zip_path}")
+        urllib.request.urlretrieve(TINY_URL, str(zip_path))
+        print("[Download] Done.")
+
+    print(f"[Extract] {zip_path} -> {root}")
+    with zipfile.ZipFile(str(zip_path), "r") as zf:
+        zf.extractall(str(root))
+    print("[Extract] Done.")
+    return str(extract_path)
+
+def prepare_val_folder_structure(tiny_root):
+    """
+    tiny-imagenet-200/val/images/*.JPEG
+    tiny-imagenet-200/val/val_annotations.txt (image\twnid\t...)
+    -> tiny-imagenet-200/val/images/<wnid>/*.JPEG 로 정리 (ImageFolder 사용 가능)
+    """
+    tiny_root = Path(tiny_root)
+    val_dir = tiny_root / "val"
+    images_dir = val_dir / "images"
+    anno_file = val_dir / "val_annotations.txt"
+
+    # 이미 폴더 구조가 정리된 경우 skip
+    # (wnid 폴더가 하나라도 있으면 정리됐다고 간주)
+    has_class_folder = any(p.is_dir() for p in images_dir.iterdir())
+    if has_class_folder:
+        # 다만 images_dir 바로 아래 JPEG가 여전히 남아있으면 혼재일 수 있음
+        # 안전하게 "정리 완료" 기준을: images_dir 아래 JPEG가 없고 디렉토리만 존재
+        has_loose_jpeg = any(p.suffix.lower() == ".jpeg" for p in images_dir.iterdir())
+        if not has_loose_jpeg:
+            return
+
+    print("[Prepare] Reorganizing val folder structure for ImageFolder...")
+
+    # annotations 로딩
+    img_to_wnid = {}
+    with open(str(anno_file), "r") as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) >= 2:
+                img, wnid = parts[0], parts[1]
+                img_to_wnid[img] = wnid
+
+    # wnid 폴더 생성 & 파일 이동
+    for img_name, wnid in img_to_wnid.items():
+        src = images_dir / img_name
+        dst_dir = images_dir / wnid
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst = dst_dir / img_name
+        if src.exists():
+            shutil.move(str(src), str(dst))
+
+    print("[Prepare] Val images moved into class folders.")
+
+tiny_root = download_tiny_imagenet("./data")
+prepare_val_folder_structure(tiny_root)
+
+train_dir = os.path.join(tiny_root, "train")
+val_dir   = os.path.join(tiny_root, "val", "images")  # 정리 후 images/<wnid>/*.JPEG
+
+# -------------------- Data Transforms --------------------
+# ImageNet normalize (Tiny-ImageNet은 보통 ImageNet stats 사용)
+mean = (0.485, 0.456, 0.406)
+std  = (0.229, 0.224, 0.225)
+
+train_tf = transforms.Compose([
+    transforms.RandomCrop(IMG_SIZE, padding=4),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize(mean, std),
+])
+
+test_tf = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean, std),
+])
+
+train_ds = datasets.ImageFolder(train_dir, transform=train_tf)
+test_ds  = datasets.ImageFolder(val_dir, transform=test_tf)
+
+pin = (device.type == "cuda")
+train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=pin)
+test_loader  = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=2, pin_memory=pin)
+
+# -------------------- Utils --------------------
+def count_params(m):
+    return sum(p.numel() for p in m.parameters() if p.requires_grad)
+
+def flops_dense(in_dim, hid, out_dim):
+    # MAC*2 근사
+    return 2 * (in_dim * hid + hid * out_dim)
+
+@torch.no_grad()
+def current_sparsity_from_mask(mask):
+    # mask: 1=alive, 0=dead
+    return 1.0 - mask.mean().item()
+
+def gate_beta_at_epoch(epoch: int) -> float:
+    """Warmup 이후 epoch에 따른 gate_beta(스케줄 적용)"""
+    if epoch < warmup_epochs:
+        return 0.0
+    if gate_beta_schedule == "none":
+        return float(gate_beta)
+
+    t = epoch - warmup_epochs
+    if gate_beta_schedule == "exp":
+        val = gate_beta * (gate_beta_mult ** t)
+        return float(min(val, gate_beta_max))
+    if gate_beta_schedule == "linear":
+        val = gate_beta * (t + 1)
+        return float(min(val, gate_beta_max))
+
+    raise ValueError(f"Unknown gate_beta_schedule={gate_beta_schedule}")
+
+# -------------------- Gate Layer (STE + min_keep) --------------------
+class DynamicGateLayer(nn.Module):
+    """
+    probs = sigmoid(logits)
+    hard  = (probs > tau)
+    STE   = probs + (hard - probs).detach()
+    min_keep: hard가 너무 낮으면 top-k로 hard 강제(open)
+    """
+    def __init__(self, size: int, tau: float = 0.7, min_keep: float = 0.1, init_logits: float = 0.0):
+        super().__init__()
+        self.logits = nn.Parameter(torch.ones(size) * float(init_logits))
+        self.tau = float(tau)
+        self.min_keep = float(min_keep)
+
+    def forward(self, x: torch.Tensor):
+        probs = torch.sigmoid(self.logits)          # (hid,)
+        hard = (probs > self.tau).float()           # (hid,)
+
+        # ✅ train/eval 모두 min_keep 보장 (붕괴 방지)
+        if hard.mean().item() < self.min_keep:
+            k = max(1, int(self.min_keep * hard.numel()))
+            thr = torch.topk(probs, k, largest=True).values.min()
+            hard = (probs >= thr).float()
+
+        gates = probs + (hard - probs).detach()     # STE (grad flows through probs)
+        return x * gates, probs, hard
+
+# -------------------- MaskedLinear (Pruned baseline 유지) --------------------
+class MaskedLinear(nn.Linear):
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__(in_features, out_features, bias=bias)
+        self.register_buffer("mask", torch.ones_like(self.weight))
+
+    @torch.no_grad()
+    def apply_mask_(self):
+        self.weight.data.mul_(self.mask)
+
+    @torch.no_grad()
+    def init_global_sparsity_(self, sparsity=0.3):
+        W = self.weight.data
+        num_total = W.numel()
+        num_keep = max(1, int(num_total * (1 - sparsity)))
+        thr = torch.topk(W.abs().view(-1), num_keep, largest=True).values.min()
+        self.mask.copy_((W.abs() >= thr).float())
+        self.apply_mask_()
+
+    def forward(self, x):
+        return F.linear(x, self.weight * self.mask, self.bias)
+
+# -------------------- DynamicGateRigL_MLP (Gate + RigL) --------------------
+class DynamicGateRigL_MLP(nn.Module):
+    def __init__(
+        self,
+        in_dim=IN_DIM,
+        hid=256,
+        out_dim=NUM_CLASSES,
+        tau=0.7,
+        min_keep=0.1,
+        init_gate_logits=0.0,
+        rigl_on_fc1=True,
+        rigl_on_fc2=False,
+        sparsity=0.8
+    ):
+        super().__init__()
+        self.in_dim, self.hid, self.out_dim = in_dim, hid, out_dim
+
+        self.fc1 = nn.Linear(in_dim, hid, bias=True)
+        self.fc2 = nn.Linear(hid, out_dim, bias=True)
+
+        self.gate = DynamicGateLayer(hid, tau=tau, min_keep=min_keep, init_logits=init_gate_logits)
+
+        self.rigl_on_fc1 = bool(rigl_on_fc1)
+        self.rigl_on_fc2 = bool(rigl_on_fc2)
+
+        # fc1 mask/ema
+        self.register_buffer("mask_fc1", torch.ones_like(self.fc1.weight))
+        self.register_buffer("grad_ema_fc1", torch.zeros_like(self.fc1.weight))
+
+        # fc2 mask/ema (optional)
+        if self.rigl_on_fc2:
+            self.register_buffer("mask_fc2", torch.ones_like(self.fc2.weight))
+            self.register_buffer("grad_ema_fc2", torch.zeros_like(self.fc2.weight))
+        else:
+            self.mask_fc2 = None
+            self.grad_ema_fc2 = None
+
+        if self.rigl_on_fc1:
+            self.apply_global_sparsity(layer="fc1", sparsity=sparsity)
+        if self.rigl_on_fc2:
+            self.apply_global_sparsity(layer="fc2", sparsity=sparsity)
+
+    @torch.no_grad()
+    def apply_masks(self):
+        if self.rigl_on_fc1:
+            self.fc1.weight.data.mul_(self.mask_fc1)
+        if self.rigl_on_fc2 and self.mask_fc2 is not None:
+            self.fc2.weight.data.mul_(self.mask_fc2)
+
+    @torch.no_grad()
+    def apply_global_sparsity(self, layer="fc1", sparsity=0.8):
+        if layer == "fc1":
+            W = self.fc1.weight.data
+            mask = self.mask_fc1
+        elif layer == "fc2" and self.rigl_on_fc2 and self.mask_fc2 is not None:
+            W = self.fc2.weight.data
+            mask = self.mask_fc2
+        else:
+            return
+
+        num_total = W.numel()
+        num_keep = max(1, int(num_total * (1 - sparsity)))
+        thr = torch.topk(W.abs().view(-1), num_keep, largest=True).values.min()
+        mask.copy_((W.abs() >= thr).float())
+        W.mul_(mask)
+
+    def forward(self, x):
+        # x: [B,3,64,64] -> flatten [B,12288]
+        x = x.view(x.size(0), -1)
+        x = F.linear(x, self.fc1.weight, self.fc1.bias)
+        x, probs, hard = self.gate(x)
+        x = F.relu(x)
+        x = self.fc2(x)
+        return x, probs, hard
+
+# -------------------- RigL utilities --------------------
+@torch.no_grad()
+def update_grad_ema_dynamicgate_rigl(model: DynamicGateRigL_MLP, ema_alpha=0.9):
+    """grad EMA 업데이트 (grow 후보 생성용)"""
+    if model.rigl_on_fc1 and model.fc1.weight.grad is not None:
+        model.grad_ema_fc1.mul_(ema_alpha).add_(model.fc1.weight.grad, alpha=(1 - ema_alpha))
+    if model.rigl_on_fc2 and model.fc2.weight.grad is not None and model.grad_ema_fc2 is not None:
+        model.grad_ema_fc2.mul_(ema_alpha).add_(model.fc2.weight.grad, alpha=(1 - ema_alpha))
+
+@torch.no_grad()
+def rigl_prune_and_grow_dynamicgate_rigl(model: DynamicGateRigL_MLP, grow_frac=0.01, init_std=0.02):
+    """
+    정확히 k개 prune & k개 grow (가능 범위 내)
+    prune: mask==1 중 |W| 작은 k개를 0
+    grow : mask==0 중 |grad_ema| 큰 k개를 1 (+ weight init)
+    """
+    def _do(W, mask, grad_ema):
+        num_total = W.numel()
+        k = int(num_total * grow_frac)
+        if k <= 0:
+            return mask
+
+        flatW = W.view(-1)
+        flatM = mask.view(-1)
+        flatG = grad_ema.view(-1).abs()
+
+        on_idx = torch.nonzero(flatM == 1, as_tuple=False).view(-1)
+        off_idx = torch.nonzero(flatM == 0, as_tuple=False).view(-1)
+
+        # 최소 1개는 alive 유지
+        k_prune = min(k, max(0, on_idx.numel() - 1))
+        k_grow  = min(k, off_idx.numel())
+        if k_prune <= 0 or k_grow <= 0:
+            return mask
+
+        # prune: on 중 |W| 작은 k_prune
+        on_vals = flatW[on_idx].abs()
+        prune_local = torch.topk(on_vals, k_prune, largest=False).indices
+        prune_idx = on_idx[prune_local]
+        flatM[prune_idx] = 0
+        flatW[prune_idx] = 0.0
+
+        # grow: off 중 |grad_ema| 큰 k_grow
+        off_idx2 = torch.nonzero(flatM == 0, as_tuple=False).view(-1)
+        off_vals = flatG[off_idx2]
+        grow_local = torch.topk(off_vals, k_grow, largest=True).indices
+        grow_idx = off_idx2[grow_local]
+        flatM[grow_idx] = 1
+
+        # 새로 연결된 weight init
+        if init_std is not None and init_std > 0:
+            flatW[grow_idx] = torch.randn_like(flatW[grow_idx]) * init_std
+        else:
+            flatW[grow_idx] = 0.0
+
+        return mask
+
+    if model.rigl_on_fc1:
+        model.mask_fc1 = _do(model.fc1.weight.data, model.mask_fc1, model.grad_ema_fc1)
+        model.fc1.weight.data.mul_(model.mask_fc1)
+
+    if model.rigl_on_fc2 and model.mask_fc2 is not None:
+        model.mask_fc2 = _do(model.fc2.weight.data, model.mask_fc2, model.grad_ema_fc2)
+        model.fc2.weight.data.mul_(model.mask_fc2)
+
+# -------------------- Train / Eval --------------------
+def train_epoch_standard(model, loader, opt):
+    """Baseline/Dropout/Pruned 공용 epoch 학습"""
+    model.train()
+    for x, y in loader:
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        opt.zero_grad(set_to_none=True)
+        logits = model(x)
+        loss = F.cross_entropy(logits, y)
+        loss.backward()
+        opt.step()
+
+@torch.no_grad()
+def evaluate_accuracy(model, loader):
+    """모델 accuracy 평가"""
+    model.eval()
+    total, correct = 0, 0
+    for x, y in loader:
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        out = model(x)
+        logits = out[0] if isinstance(out, tuple) else out
+        pred = logits.argmax(1)
+        correct += (pred == y).sum().item()
+        total += y.size(0)
+    return correct / total
+
+def train_epoch_dynamicgate_rigl(model: DynamicGateRigL_MLP, loader, opt, epoch, global_step):
+    """DynamicGateRigL_MLP 전용 학습(epoch 1회)"""
+    model.train()
+    total, correct = 0, 0
+    beta_now = gate_beta_at_epoch(epoch)
+
+    for x, y in loader:
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+
+        # ✅ mask 적용 상태 유지
+        model.apply_masks()
+
+        opt.zero_grad(set_to_none=True)
+        logits, probs, hard = model(x)
+
+        loss = F.cross_entropy(logits, y)
+
+        # ✅ 미분 가능한 gate 규제(soft mean)
+        if beta_now > 0:
+            r_soft = probs.mean()
+            loss = loss + beta_now * (r_soft - target_keep) ** 2
+
+        loss.backward()
+
+        # RigL grow 후보용 grad EMA 업데이트
+        update_grad_ema_dynamicgate_rigl(model, ema_alpha=ema_grad_alpha)
+
+        opt.step()
+
+        # ✅ weight가 죽은 connection을 다시 채우지 않도록 mask 유지
+        model.apply_masks()
+
+        # RigL prune&grow
+        global_step += 1
+        if global_step % rigl_update_every == 0:
+            rigl_prune_and_grow_dynamicgate_rigl(model, grow_frac=rigl_grow_frac, init_std=0.02)
+            model.apply_masks()
+
+        pred = logits.argmax(1)
+        correct += (pred == y).sum().item()
+        total += y.size(0)
+
+    return correct / total, global_step, beta_now
+
+@torch.no_grad()
+def estimate_gate_stats_dynamicgate_rigl(model: DynamicGateRigL_MLP, loader, num_batches=8):
+    """gate_soft/prob mean과 gate_hard mean 추정"""
+    model.eval()
+    soft_sum, hard_sum, n = 0.0, 0.0, 0
+    it = iter(loader)
+
+    for _ in range(num_batches):
+        try:
+            x, _ = next(it)
+        except StopIteration:
+            break
+        x = x.to(device, non_blocking=True)
+        model.apply_masks()
+        _, probs, hard = model(x)
+        soft_sum += probs.mean().item()
+        hard_sum += hard.mean().item()
+        n += 1
+
+    if n == 0:
+        return 0.0, 0.0
+    return soft_sum / n, hard_sum / n
+
+# -------------------- Run Experiments --------------------
+print(f"\n=== PRESET: {PRESET} | device={device} ===")
+print(f"Dataset: Tiny ImageNet (200 classes, 64x64 RGB)")
+print(f"Dropout baseline: p={dropout_p}")
+print(f"Gate: tau={tau}, min_keep={min_keep}, target_keep={target_keep}, warmup={warmup_epochs}, "
+      f"gate_beta={gate_beta}, schedule={gate_beta_schedule}")
+print(f"RigL: sparsity={rigl_sparsity}, update_every={rigl_update_every}, grow_frac={rigl_grow_frac}, ema={ema_grad_alpha}")
+print("")
+
+results = []
+
+# Base FLOPs for reference
+base_flops = flops_dense(IN_DIM, hidden, NUM_CLASSES)
+
+# (1) Baseline MLP
+baseline_mlp = nn.Sequential(
+    nn.Flatten(),
+    nn.Linear(IN_DIM, hidden),
+    nn.ReLU(),
+    nn.Linear(hidden, NUM_CLASSES)
+).to(device)
+
+opt = torch.optim.Adam(baseline_mlp.parameters(), lr=lr)
+for ep in range(epochs):
+    train_epoch_standard(baseline_mlp, train_loader, opt)
+acc_base = evaluate_accuracy(baseline_mlp, test_loader)
+
+results.append([
+    "Baseline MLP",
+    acc_base * 100,
+    0.0,
+    0.0,
+    count_params(baseline_mlp),
+    int(base_flops)
+])
+
+# (2) Dropout MLP
+dropout_mlp = nn.Sequential(
+    nn.Flatten(),
+    nn.Linear(IN_DIM, hidden),
+    nn.ReLU(),
+    nn.Dropout(p=dropout_p),
+    nn.Linear(hidden, NUM_CLASSES)
+).to(device)
+
+opt = torch.optim.Adam(dropout_mlp.parameters(), lr=lr)
+for ep in range(epochs):
+    train_epoch_standard(dropout_mlp, train_loader, opt)
+acc_drop = evaluate_accuracy(dropout_mlp, test_loader)
+
+# Dropout은 inference에서 비활성화되므로 FLOPs 감소는 없음
+results.append([
+    f"Dropout MLP (p={dropout_p})",
+    acc_drop * 100,
+    0.0,
+    0.0,
+    count_params(dropout_mlp),
+    int(base_flops)
+])
+
+# (3) Pruned MLP (MaskedLinear 유지)
+pruned_mlp = nn.Sequential(
+    nn.Flatten(),
+    MaskedLinear(IN_DIM, hidden),
+    nn.ReLU(),
+    nn.Linear(hidden, NUM_CLASSES)
+).to(device)
+
+# ✅ pruned_mlp[1]은 MaskedLinear
+pruned_mlp[1].init_global_sparsity_(sparsity=prune_sparsity)
+
+opt = torch.optim.Adam(pruned_mlp.parameters(), lr=lr)
+
+for ep in range(epochs):
+    pruned_mlp.train()
+    for x, y in train_loader:
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        opt.zero_grad(set_to_none=True)
+        logits = pruned_mlp(x)
+        loss = F.cross_entropy(logits, y)
+        loss.backward()
+        opt.step()
+
+        # ✅ prune mask 유지(학습 중 복원 방지)
+        pruned_mlp[1].apply_mask_()
+
+acc_pruned = evaluate_accuracy(pruned_mlp, test_loader)
+
+keep_ratio = pruned_mlp[1].mask.mean().item()
+pruned_flops = 2 * (IN_DIM * hidden * keep_ratio + hidden * NUM_CLASSES)
+
+results.append([
+    "Pruned MLP (masked)",
+    acc_pruned * 100,
+    0.0,
+    100 * (1 - pruned_flops / base_flops),
+    count_params(pruned_mlp),
+    int(pruned_flops)
+])
+
+# (4) DynamicGateRigL_MLP (Gate + RigL)
+dynamicgate_rigl_mlp = DynamicGateRigL_MLP(
+    in_dim=IN_DIM,
+    hid=hidden,
+    out_dim=NUM_CLASSES,
+    tau=tau,
+    min_keep=min_keep,
+    init_gate_logits=0.0,           # ✅ logits 0 => sigmoid 0.5 시작
+    rigl_on_fc1=True,
+    rigl_on_fc2=apply_rigl_to_fc2,
+    sparsity=rigl_sparsity
+).to(device)
+
+opt = torch.optim.Adam(dynamicgate_rigl_mlp.parameters(), lr=lr)
+
+global_step = 0
+for ep in range(epochs):
+    tr_acc, global_step, beta_now = train_epoch_dynamicgate_rigl(dynamicgate_rigl_mlp, train_loader, opt, ep, global_step)
+
+    fc1_sparsity_now = current_sparsity_from_mask(dynamicgate_rigl_mlp.mask_fc1)
+    gate_soft, gate_hard = estimate_gate_stats_dynamicgate_rigl(dynamicgate_rigl_mlp, train_loader, num_batches=log_gate_batches)
+
+    print(
+        f"[DynamicGateRigL_MLP ep {ep+1:02d}] beta={beta_now:.3g} | train_acc={tr_acc*100:.2f}% "
+        f"| fc1_sparsity={fc1_sparsity_now*100:.1f}% | gate_soft={gate_soft:.3f} | gate_hard={gate_hard:.3f}"
+    )
+
+acc_dg = evaluate_accuracy(dynamicgate_rigl_mlp, test_loader)
+
+# FLOPs estimate:
+# fc1: mask 밀도 반영
+# fc2: gate_soft로 “활성 은닉 비율” 근사
+fc1_sparsity_now = current_sparsity_from_mask(dynamicgate_rigl_mlp.mask_fc1)
+keep_fc1 = 1.0 - fc1_sparsity_now
+gate_soft, _ = estimate_gate_stats_dynamicgate_rigl(dynamicgate_rigl_mlp, train_loader, num_batches=log_gate_batches)
+
+dynamicgate_rigl_flops_est = 2 * (IN_DIM * hidden * keep_fc1 + hidden * NUM_CLASSES * gate_soft)
+
+results.append([
+    "DynamicGateRigL_MLP (Gate+RigL)",
+    acc_dg * 100,
+    0.0,
+    100 * (1 - dynamicgate_rigl_flops_est / base_flops),
+    count_params(dynamicgate_rigl_mlp),
+    int(dynamicgate_rigl_flops_est)
+])
+
+df = pd.DataFrame(results, columns=[
+    "Model", "Accuracy(%)", "Param Reduction(%)", "FLOPs Reduction(%)", "Params", "FLOPs"
+])
+
+print("\n=== Summary ===")
+print(df)

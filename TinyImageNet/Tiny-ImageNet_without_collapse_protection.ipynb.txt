@@ -1,0 +1,549 @@
+# Paper : Souce code for Speech Commands dataset 
+# this code is verified on Colab 
+
+# author : 2026. 2. 4 by Yong il Choi / 
+# Open Reseach Lab of Sorynorydotcom Co,. Ltd. 
+
+# Dynamicgate MLP only version
+
+# ============================================
+# Tiny-ImageNet: Baseline / Dropout / Pruned / Gate-MLP (FIXED)
+# ============================================
+
+import os, random, urllib.request, zipfile, shutil
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+
+# -------------------- 설정 --------------------
+epochs = 50
+batch_size = 128
+lr = 1e-3
+hidden = 256
+
+# ✅ Gate-MLP 핵심 튜닝 (threshold/temperature 분리)
+gate_beta = 1e-4
+gate_temp = 1.0              # temperature (연속 확률을 부드럽게)
+gate_threshold = 0.05       # hard gate threshold (0/1 결정 임계값)
+target_sparsity = 0.95       # 95% 닫힘 유도
+gate_warmup_epochs = 5       # warmup 동안 gate loss 0
+
+prune_ratio = 0.3
+seed = 42
+
+IMG_SIZE = 64
+IN_C = 3
+NUM_CLASSES = 200
+input_dim = IMG_SIZE * IMG_SIZE * IN_C
+output_dim = NUM_CLASSES
+
+# -------------------- 시드 고정 --------------------
+def set_seed(seed=42):
+    print("시드 값:", seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+set_seed(seed)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# -------------------- Tiny-ImageNet 다운로드/정리 --------------------
+DATA_DIR = "./tiny-imagenet-200"
+ZIP_PATH = "tiny-imagenet-200.zip"
+URL = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
+
+def ensure_tiny_imagenet():
+    if not os.path.exists(DATA_DIR):
+        print("Downloading Tiny-ImageNet (≈240MB)...")
+        urllib.request.urlretrieve(URL, ZIP_PATH)
+        print("Extracting...")
+        with zipfile.ZipFile(ZIP_PATH, 'r') as zf:
+            zf.extractall("./")
+        print("✅ Download complete")
+
+    val_images = os.path.join(DATA_DIR, "val", "images")
+    val_anno = os.path.join(DATA_DIR, "val", "val_annotations.txt")
+    target_root = os.path.join(DATA_DIR, "val", "images_by_class")
+
+    if not os.path.exists(target_root):
+        os.makedirs(target_root, exist_ok=True)
+        print("Reorganizing validation images by class...")
+
+        mapping = {}
+        with open(val_anno, "r") as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) >= 2:
+                    mapping[parts[0]] = parts[1]
+
+        for img_file, cls in mapping.items():
+            cls_dir = os.path.join(target_root, cls)
+            os.makedirs(cls_dir, exist_ok=True)
+            src = os.path.join(val_images, img_file)
+            dst = os.path.join(cls_dir, img_file)
+            if os.path.exists(src) and not os.path.exists(dst):
+                shutil.move(src, dst)
+
+        print("✅ Validation reorg complete")
+
+ensure_tiny_imagenet()
+
+# -------------------- 데이터/로더 --------------------
+mean = (0.480, 0.448, 0.398)
+std  = (0.277, 0.269, 0.282)
+
+transform_train = transforms.Compose([
+    transforms.Resize(IMG_SIZE),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize(mean, std),
+])
+
+transform_val = transforms.Compose([
+    transforms.Resize(IMG_SIZE),
+    transforms.ToTensor(),
+    transforms.Normalize(mean, std),
+])
+
+train_dir = os.path.join(DATA_DIR, "train")
+val_dir   = os.path.join(DATA_DIR, "val", "images_by_class")
+
+train_ds = datasets.ImageFolder(train_dir, transform=transform_train)
+val_ds   = datasets.ImageFolder(val_dir,   transform=transform_val)
+
+train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=2, pin_memory=True)
+val_loader   = DataLoader(val_ds,   batch_size=512,       shuffle=False, num_workers=2, pin_memory=True)
+
+print(f"Train size: {len(train_ds)},  Val size: {len(val_ds)}")
+print(f"Classes: {len(train_ds.classes)}")
+
+# -------------------- 모델 정의 --------------------
+class MLP(nn.Module):
+    def __init__(self, input_dim=input_dim, hidden_dim=hidden, output_dim=output_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        return self.fc2(x)
+
+class DropoutMLP(nn.Module):
+    def __init__(self, input_dim=input_dim, hidden_dim=hidden, output_dim=output_dim, p=0.5):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.drop = nn.Dropout(p)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        x = self.drop(x)
+        return self.fc2(x)
+
+# # ✅ GateLayer 수정: threshold vs temperature 분리
+# class GateLayer(nn.Module):
+#     def __init__(self, size, threshold=0.5, temp=1.0, init_logit=0.0):
+#         super().__init__()
+#         # init_logit=0이면 sigmoid=0.5 (너무 닫힘도, 너무 열림도 아님)
+#         self.gate_logit = nn.Parameter(torch.ones(size) * init_logit)
+#         self.threshold = threshold
+#         self.temp = temp
+
+#     def forward(self, x):
+#         # temperature 적용 (부드럽게)
+#         probs = torch.sigmoid(self.gate_logit / self.temp)     # (size,)
+#         hard = (probs > self.threshold).float()                # (size,)
+#         # STE: forward는 hard, backward는 probs
+#         gates = hard + (probs - hard).detach()
+#         return x * gates, probs, hard
+
+# ✅ GateLayer: last_probs/last_hard 저장 (FLOPs 추정에 사용)
+class GateLayer(nn.Module):
+    def __init__(self, size, threshold=0.5, temp=1.0, init_logit=0.0):
+        super().__init__()
+        self.gate_logit = nn.Parameter(torch.ones(size) * init_logit)
+        self.threshold = threshold
+        self.temp = temp
+        # last stats (buffer 느낌으로 저장)
+        self.last_probs = None
+        self.last_hard = None
+
+    def forward(self, x):
+        probs = torch.sigmoid(self.gate_logit / self.temp)     # (size,)
+        hard = (probs > self.threshold).float()                # (size,)
+        gates = hard + (probs - hard).detach()                 # STE
+
+        # ✅ 저장 (detach해서 그래프 밖으로)
+        self.last_probs = probs.detach()
+        self.last_hard  = hard.detach()
+
+        return x * gates, probs, hard
+
+
+
+class DynamicGateMLP(nn.Module):
+    def __init__(self, input_dim=input_dim, hidden_dim=hidden, output_dim=output_dim,
+                 threshold=0.5, temp=1.0):
+        super().__init__()
+        self.gate_in  = GateLayer(input_dim, threshold=threshold, temp=temp, init_logit=0.0)
+        self.fc1      = nn.Linear(input_dim, hidden_dim)
+        self.gate_hid = GateLayer(hidden_dim, threshold=threshold, temp=temp, init_logit=0.0)
+        self.fc2      = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x, pin, hin = self.gate_in(x)
+        x = self.fc1(x)
+        x, ph, hh = self.gate_hid(x)
+        x = F.relu(x)
+        logits = self.fc2(x)
+        # probs/hard 둘 다 리턴 (지표를 일관되게 만들기 위해)
+        return logits, ph, hh
+
+# -------------------- 학습/평가 함수 --------------------
+def _macs_linear_dense(in_dim, out_dim):
+    return int(in_dim * out_dim)
+
+def _macs_elemwise(dim):
+    return int(dim)
+
+def _macs_linear_sparse_from_mask(mask: torch.Tensor):
+    # mask: (out, in) with 0/1
+    return int(mask.sum().item())
+
+def flops_breakdown(model, input_dim, hidden_dim, output_dim, assume_skip=False, include_gate_mul=True):
+    """
+    assume_skip=False: 현재 코드(as-implemented) 기준 (dense matmul을 그대로 한다)
+    assume_skip=True : 게이트/마스크를 이용해 실제로 matmul을 스킵했다고 가정(theoretical)
+    반환: dict(layer->MACs) + total_MACs
+    """
+
+    # 1) gate open ratios (없으면 1.0로 처리)
+    open_in = 1.0
+    open_hid = 1.0
+
+    if hasattr(model, "gate_in") and getattr(model.gate_in, "last_hard", None) is not None:
+        open_in = float(model.gate_in.last_hard.mean().item())
+
+    if hasattr(model, "gate_hid") and getattr(model.gate_hid, "last_hard", None) is not None:
+        open_hid = float(model.gate_hid.last_hard.mean().item())
+
+    # 2) fc1 형태: dense(fc1) vs RigL sparse(fc1_rigl)
+    has_dense_fc1 = hasattr(model, "fc1") and isinstance(getattr(model, "fc1"), nn.Linear)
+    has_rigl_fc1  = hasattr(model, "fc1_rigl")  # SparseLinearRigL wrapper
+
+    breakdown = {}
+
+    # gate_in elementwise multiply (실제로는 x*gates 연산이 존재)
+    if include_gate_mul and hasattr(model, "gate_in"):
+        breakdown["gate_in_mul"] = _macs_elemwise(input_dim)
+    else:
+        breakdown["gate_in_mul"] = 0
+
+    # fc1
+    if has_dense_fc1:
+        if assume_skip:
+            # 게이트로 입력 feature를 실제로 제외하고 matmul 했다고 가정
+            eff_in = max(1, int(round(input_dim * open_in)))
+            breakdown["fc1"] = _macs_linear_dense(eff_in, hidden_dim)
+        else:
+            # 현재 구현: gate로 0 만들어도 dense matmul은 그대로 수행
+            breakdown["fc1"] = _macs_linear_dense(input_dim, hidden_dim)
+
+    elif has_rigl_fc1:
+        # RigL sparse weights 기반
+        mask = model.fc1_rigl.mask  # (out, in)
+        nnz = _macs_linear_sparse_from_mask(mask)
+
+        if assume_skip:
+            # input gate까지 활용해 "활성 input에 걸린 연결만" 계산한다고 가정
+            # 정확 계산은 어렵고, 빠른 근사: nnz * open_in (독립 가정)
+            breakdown["fc1_rigl"] = int(round(nnz * open_in))
+        else:
+            # 현재 구현: fc1_rigl forward는 이미 mask가 곱해진 dense F.linear라서
+            # "실제 연산"은 framework상 dense일 수 있음(진짜 sparse matmul이 아님).
+            # 여기서는 '구조적으로 남은 연결 수(nnz)'를 MACs로 보고 싶다면 nnz로,
+            # 실제 커널 실행 비용을 보수적으로 잡고 싶다면 input_dim*hidden_dim로 잡을 수도 있음.
+            # 👉 여기서는 연구 관점(구조적 MACs)로 nnz를 반환.
+            breakdown["fc1_rigl"] = nnz
+
+    # gate_hid elementwise multiply
+    if include_gate_mul and hasattr(model, "gate_hid"):
+        breakdown["gate_hid_mul"] = _macs_elemwise(hidden_dim)
+    else:
+        breakdown["gate_hid_mul"] = 0
+
+    # fc2
+    if hasattr(model, "fc2") and isinstance(getattr(model, "fc2"), nn.Linear):
+        if assume_skip:
+            eff_h = max(1, int(round(hidden_dim * open_hid)))
+            breakdown["fc2"] = _macs_linear_dense(eff_h, output_dim)
+        else:
+            breakdown["fc2"] = _macs_linear_dense(hidden_dim, output_dim)
+
+    breakdown["total_MACs"] = sum(v for k, v in breakdown.items() if k != "total_MACs")
+
+    # FLOPs로 보고 싶으면 보통 MACs*2 (mul+add)로 표기
+    breakdown["total_FLOPs(2*MACs)"] = 2 * breakdown["total_MACs"]
+
+    # 참고 정보도 같이
+    breakdown["open_in(hard_mean)"] = open_in
+    breakdown["open_hid(hard_mean)"] = open_hid
+
+    return breakdown
+
+def train_epoch(model, loader, opt, device, crit,
+                epoch=0, gate_beta=0.0, target_sparsity=None, warmup_epochs=0,
+                prune_mask=None):
+    model.train(); total, correct = 0, 0
+
+    # target open-rate
+    target_open = None
+    if target_sparsity is not None:
+        target_open = 1.0 - float(target_sparsity)
+
+    for x, y in loader:
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        opt.zero_grad()
+
+        out = model(x)
+
+        if isinstance(out, tuple) and len(out) == 3:
+            logits, probs, hard = out
+            loss = crit(logits, y)
+
+            # warmup 동안 gate loss를 꺼서 붕괴 방지
+            if epoch >= warmup_epochs and gate_beta > 0.0:
+                if target_open is None:
+                    # 그냥 열림 최소화(붕괴 위험↑) 대신 완만하게
+                    gate_loss = probs.mean()
+                else:
+                    # ✅ target open-rate에 맞추는 loss (붕괴 방지에 훨씬 안정적)
+                   # gate_loss = (probs.mean() - target_open) ** 2
+                    gate_loss = (probs.mean() - target_open)**2 + α * ReLU(min_open - probs.mean())
+                loss = loss + gate_beta * gate_loss
+        else:
+            logits = out
+            loss = crit(logits, y)
+
+        loss.backward()
+        opt.step()
+
+        # ✅ pruning mask 유지: step 후 다시 0을 강제
+        if prune_mask is not None:
+            with torch.no_grad():
+                model.fc1.weight.mul_(prune_mask)
+
+        correct += (logits.argmax(1) == y).sum().item()
+        total += y.size(0)
+
+    return correct / total
+
+@torch.no_grad()
+def test_epoch(model, loader, device, crit):
+    model.eval(); total, correct = 0, 0
+    gate_probs = []
+    gate_hard_ratio = []
+
+    for x, y in loader:
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        out = model(x)
+
+        if isinstance(out, tuple) and len(out) == 3:
+            logits, probs, hard = out
+            gate_probs.append(probs.mean().item())
+            gate_hard_ratio.append(hard.mean().item())
+        else:
+            logits = out
+
+        correct += (logits.argmax(1) == y).sum().item()
+        total += y.size(0)
+
+    mean_probs = (sum(gate_probs)/len(gate_probs)) if gate_probs else None
+    mean_hard  = (sum(gate_hard_ratio)/len(gate_hard_ratio)) if gate_hard_ratio else None
+    return correct / total, mean_probs, mean_hard
+
+# -------------------- FLOPs & Params 계산 --------------------
+def compute_stats(model, active_ratio=None):
+    params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    if hasattr(model, 'fc1') and hasattr(model, 'fc2'):
+        in_dim  = model.fc1.in_features
+        hid_dim = model.fc1.out_features
+        out_dim = model.fc2.out_features
+        flops = in_dim * hid_dim + hid_dim * out_dim
+    else:
+        flops = 0
+
+    # active_ratio는 "실제 활성 비율(=hard.mean 등)"로 넣는 것을 권장
+    if active_ratio is not None:
+        flops = int(flops * float(active_ratio))
+
+    return params, flops
+
+# -------------------- Pruning 함수 (mask 유지) --------------------
+def apply_pruning_with_mask(model, ratio=0.3):
+    with torch.no_grad():
+        weight = model.fc1.weight.abs()
+        thresh = torch.quantile(weight.view(-1), ratio)
+        mask = (weight > thresh).float()
+        model.fc1.weight.mul_(mask)
+    return model, mask
+
+# -------------------- Gate 시각화 --------------------
+def show_gate_matrix(model, rows=16, cols=16):
+    if not hasattr(model, "gate_hid"):
+        print("This model has no gate_hid.")
+        return
+
+    g = model.gate_hid
+    with torch.no_grad():
+        probs = torch.sigmoid(g.gate_logit / g.temp).cpu().numpy()
+        hard = (probs > g.threshold).astype(int)
+
+    df_probs = pd.DataFrame(probs.reshape(1, -1))
+    df_hard  = pd.DataFrame(hard.reshape(1, -1))
+
+    print(f"\n[Hidden Gate] Gate probabilities (0~1):")
+    try:
+        from IPython.display import display
+        display(df_probs)
+    except:
+        print(df_probs.head())
+
+    print(f"\n[Hidden Gate] Gate hard values (0/1):")
+    try:
+        from IPython.display import display
+        display(df_hard)
+    except:
+        print(df_hard.head())
+
+    print(f"\n[Hidden Gate] Active gates: {df_hard.values.sum()} / {df_hard.size}")
+
+    try:
+        hard_matrix = hard.reshape(rows, cols)
+        plt.figure(figsize=(5,4))
+        plt.imshow(hard_matrix, cmap="Greens", aspect="auto")
+        plt.colorbar(label="Gate (0=off, 1=on)")
+        plt.title("DynamicGate-MLP Hidden Gate Status")
+        plt.tight_layout()
+        plt.show()
+    except Exception as e:
+        print("Cannot reshape to matrix:", e)
+
+# -------------------- 실행 --------------------
+crit = nn.CrossEntropyLoss()
+results = []
+
+# Baseline MLP
+mlp = MLP(input_dim=input_dim, hidden_dim=hidden, output_dim=output_dim).to(device)
+opt = torch.optim.Adam(mlp.parameters(), lr=lr)
+for e in range(epochs):
+    tr = train_epoch(mlp, train_loader, opt, device, crit, epoch=e)
+    te, _, _ = test_epoch(mlp, val_loader, device, crit)
+print("Baseline MLP acc:", te)
+params, flops = compute_stats(mlp)
+results.append(["Baseline MLP", te*100, 0, 0, params, flops])
+
+# Dropout MLP
+drop = DropoutMLP(input_dim=input_dim, hidden_dim=hidden, output_dim=output_dim, p=0.5).to(device)
+opt_d = torch.optim.Adam(drop.parameters(), lr=lr)
+for e in range(epochs):
+    tr = train_epoch(drop, train_loader, opt_d, device, crit, epoch=e)
+    te, _, _ = test_epoch(drop, val_loader, device, crit)
+print("Dropout MLP acc:", te)
+params, flops = compute_stats(drop)
+results.append(["Dropout MLP", te*100, 0, 0, params, flops])
+
+# Pruned MLP (mask 유지)
+pruned = MLP(input_dim=input_dim, hidden_dim=hidden, output_dim=output_dim).to(device)
+pruned, prune_mask = apply_pruning_with_mask(pruned, prune_ratio)
+opt_p = torch.optim.Adam(pruned.parameters(), lr=lr)
+for e in range(epochs):
+    tr = train_epoch(pruned, train_loader, opt_p, device, crit, epoch=e, prune_mask=prune_mask)
+    te, _, _ = test_epoch(pruned, val_loader, device, crit)
+print("Pruned MLP acc:", te)
+params, flops = compute_stats(pruned, active_ratio=(1-prune_ratio))
+results.append(["Pruned MLP", te*100, prune_ratio*100, prune_ratio*100, params, flops])
+
+# DynamicGate-MLP (FIXED)
+gate = DynamicGateMLP(
+    input_dim=input_dim, hidden_dim=hidden, output_dim=output_dim,
+    threshold=gate_threshold, temp=gate_temp
+).to(device)
+
+opt_g = torch.optim.Adam(gate.parameters(), lr=lr)
+for e in range(epochs):
+    tr = train_epoch(
+        gate, train_loader, opt_g, device, crit,
+        epoch=e,
+        gate_beta=gate_beta,
+        target_sparsity=target_sparsity,
+        warmup_epochs=gate_warmup_epochs
+    )
+    te, gp, gh = test_epoch(gate, val_loader, device, crit)
+
+    # ✅ 현재 구현 기준(as-implemented): 게이트로 0 만들어도 fc1/fc2는 dense 연산
+    bd_real = flops_breakdown(gate, input_dim, hidden, output_dim, assume_skip=False)
+
+    # ✅ 이상적 스킵 기준(theoretical): 게이트/마스크로 진짜 matmul을 줄였다고 가정
+    bd_skip = flops_breakdown(gate, input_dim, hidden, output_dim, assume_skip=True)
+
+    print("\n[AS-IMPLEMENTED] (현재 코드 기준) MACs breakdown:")
+    for k, v in bd_real.items():
+        print(k, ":", v)
+
+    print("\n[THEORETICAL-SKIP] (게이트로 진짜 연산 스킵 가정) MACs breakdown:")
+    for k, v in bd_skip.items():
+        print(k, ":", v)
+
+print("Gate MLP acc:", te, "mean prob:", gp, "mean hard:", gh)
+
+# ✅ FLOPs/Param 감소는 hard 활성비율(gh)로 계산하는 게 일관됨
+active_ratio = gh if gh is not None else gp
+params, flops = compute_stats(gate, active_ratio=active_ratio)
+param_red = (1-active_ratio)*100 if active_ratio is not None else None
+flops_red = (1-active_ratio)*100 if active_ratio is not None else None
+results.append(["DynamicGate-MLP", te*100, param_red, flops_red, params, flops])
+
+# -------------------- 결과 표 --------------------
+df = pd.DataFrame(results, columns=["Model","Accuracy(%)","Param Reduction(%)","FLOPs Reduction(%)","Params","FLOPs"])
+try:
+    from IPython.display import display
+    display(df)
+except:
+    print(df)
+
+show_gate_matrix(gate, rows=16, cols=16)
+
+# -------------------- 그래프 시각화 --------------------
+models = df["Model"].tolist()
+
+plt.figure(figsize=(12,4))
+plt.subplot(1,3,1)
+plt.bar(models, df["Accuracy(%)"])
+plt.title("Accuracy (%)")
+plt.ylabel("Accuracy (%)")
+plt.xticks(rotation=20)
+
+plt.subplot(1,3,2)
+plt.bar(models, df["Params"])
+plt.title("Number of Parameters")
+plt.ylabel("Params")
+plt.xticks(rotation=20)
+
+plt.subplot(1,3,3)
+plt.bar(models, df["FLOPs"])
+plt.title("FLOPs (Approx.)")
+plt.ylabel("FLOPs")
+plt.xticks(rotation=20)
+
+plt.suptitle("Model Comparison: Accuracy / Params / FLOPs", fontsize=14)
+plt.tight_layout()
+plt.show()

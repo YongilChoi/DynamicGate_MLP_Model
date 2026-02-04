@@ -1,0 +1,367 @@
+## Souce code for Speech Commands dataset 
+# this code is verified on Colab 
+
+# author : 2026. 2. 4 by Yong il Choi / 
+# Open Reseach Lab of Sorynorydotcom Co,. Ltd. 
+
+
+# ============================================================
+# Gate-MLP 자동 탐색 (Baseline 정확도 근접 + FLOPs 최소)
+# - threshold / lambda_g / tau_end / target_open 을 sweep
+# - 결과: acc vs flops Pareto / 상위 설정 출력
+# ============================================================
+
+import math, itertools, time
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from dataclasses import dataclass
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("[device]", device)
+
+# -------------------------
+# (0) 필요: loader 존재 확인
+# -------------------------
+assert "train_loader" in globals()
+assert "test_loader" in globals()
+
+# -------------------------
+# (1) Dense MACs 계산 (Baseline FLOPs proxy)
+# -------------------------
+def dense_macs(in_dim, h1, h2, out_dim):
+    # FC MACs: in*h1 + h1*h2 + h2*out
+    return in_dim*h1 + h1*h2 + h2*out_dim
+
+def gated_macs(in_dim, h1, h2, out_dim, open1, open2):
+    # open1/open2는 0~1 비율
+    a1 = max(1.0, h1*open1)
+    a2 = max(1.0, h2*open2)
+    return in_dim*a1 + a1*a2 + a2*out_dim
+
+# -------------------------
+# (2) Gate-MLP 모델
+# -------------------------
+class GateMLP(nn.Module):
+    def __init__(self, in_dim, h1, h2, out_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, h1)
+        self.fc2 = nn.Linear(h1, h2)
+        self.fc3 = nn.Linear(h2, out_dim)
+
+        self.g1 = nn.Parameter(torch.zeros(h1))  # gate logits
+        self.g2 = nn.Parameter(torch.zeros(h2))
+
+        self.tau = 2.0
+        self.th  = 0.5
+
+    def set_tau(self, tau):
+        self.tau = float(tau)
+
+    def forward(self, x, hard_gate=True):
+        # x: [B, in_dim]
+        x = x.view(x.size(0), -1) # <--- ADDED THIS LINE TO FLATTEN INPUT
+        h1 = F.relu(self.fc1(x))
+        p1 = torch.sigmoid(self.g1 / self.tau)         # [h1]
+        m1 = (p1 > self.th).float()                    # hard mask
+
+        if self.training:
+            m1_use = (m1 - p1).detach() + p1           # STE
+        else:
+            m1_use = m1 if hard_gate else p1
+
+        h1 = h1 * m1_use
+
+        h2 = F.relu(self.fc2(h1))
+        p2 = torch.sigmoid(self.g2 / self.tau)
+        m2 = (p2 > self.th).float()
+
+        if self.training:
+            m2_use = (m2 - p2).detach() + p2
+        else:
+            m2_use = m2 if hard_gate else p2
+
+        h2 = h2 * m2_use
+
+        out = self.fc3(h2)
+        return out, p1, p2, m1, m2
+
+# -------------------------
+# (3) 평가 함수
+# -------------------------
+@torch.no_grad()
+def eval_acc_and_open(model, loader):
+    model.eval()
+    correct, total = 0, 0
+    o1_sum, o2_sum = 0.0, 0.0
+    nb = 0
+
+    for xb, yb in loader:
+        xb = xb.to(device)
+        yb = yb.to(device)
+
+        logits, p1, p2, m1, m2 = model(xb, hard_gate=True)
+        pred = logits.argmax(dim=1)
+
+        correct += (pred == yb).sum().item()
+        total   += yb.numel()
+
+        o1_sum += m1.mean().item()
+        o2_sum += m2.mean().item()
+        nb += 1
+
+    acc = correct / max(1,total)
+    o1 = o1_sum / max(1,nb)
+    o2 = o2_sum / max(1,nb)
+    return acc, o1, o2
+
+# -------------------------
+# (4) 학습 함수
+# -------------------------
+def train_gate_model(cfg, in_dim, h1, h2, out_dim, train_loader, val_loader, base_macs, base_acc=None):
+    model = GateMLP(in_dim, h1, h2, out_dim).to(device)
+    model.th = cfg["threshold"]
+
+    # (선택) 게이트만 학습
+    if cfg.get("freeze_weights", True):
+        for p in model.fc1.parameters(): p.requires_grad = False
+        for p in model.fc2.parameters(): p.requires_grad = False
+        for p in model.fc3.parameters(): p.requires_grad = False
+
+    params = [{"params":[model.g1, model.g2], "lr": cfg["lr_gate"]}]
+    if not cfg.get("freeze_weights", True):
+        params.append({"params": list(model.fc1.parameters()) + list(model.fc2.parameters()) + list(model.fc3.parameters()),
+                       "lr": cfg.get("lr_w", 1e-4)})
+
+    opt = torch.optim.Adam(params)
+
+    # tau schedule
+    tau0 = cfg["tau_start"]
+    tau1 = cfg["tau_end"]
+    E = cfg["epochs"]
+
+    def tau_at(ep):
+        if E <= 1: return tau1
+        t = ep/(E-1)
+        return (1-t)*tau0 + t*tau1
+
+    # loss terms
+    lam = cfg["lambda_g"]
+    use_target = cfg.get("use_target_open", False)
+    tgt1 = cfg.get("target_open1", None)
+    tgt2 = cfg.get("target_open2", None)
+    alpha = cfg.get("alpha_target", 0.0)
+
+    best = {"val_acc": -1, "state": None, "best_ep": -1, "best_o1": None, "best_o2": None}
+
+    for ep in range(E):
+        model.train()
+        model.set_tau(tau_at(ep))
+
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+
+            opt.zero_grad()
+            logits, p1, p2, m1, m2 = model(xb, hard_gate=True)
+            ce = F.cross_entropy(logits, yb)
+
+            # sparse pressure: p 평균 낮추기
+            reg_sparse = lam * 0.5*(p1.mean() + p2.mean())
+
+            # target-open (옵션): 원하는 open-rate 근처로 유도
+            reg_target = 0.0
+            if use_target and (tgt1 is not None) and (tgt2 is not None) and alpha > 0:
+                reg_target = alpha * ((p1.mean()-tgt1)**2 + (p2.mean()-tgt2)**2)
+
+            loss = ce + reg_sparse + reg_target
+            loss.backward()
+            opt.step()
+
+        # val 평가
+        val_acc, o1, o2 = eval_acc_and_open(model, val_loader)
+
+        if val_acc > best["val_acc"]:
+            best["val_acc"] = val_acc
+            best["state"] = {k:v.detach().cpu().clone() for k,v in model.state_dict().items()}
+            best["best_ep"] = ep
+            best["best_o1"] = o1
+            best["best_o2"] = o2
+
+    # best state 로드 후 test 평가
+    model.load_state_dict(best["state"])
+    test_acc, o1, o2 = eval_acc_and_open(model, test_loader)
+
+    mac_gate = gated_macs(in_dim, h1, h2, out_dim, o1, o2)
+    flops_rel = mac_gate / base_macs
+
+    out = {
+        "acc": test_acc,
+        "open1": o1,
+        "open2": o2,
+        "flops_rel": flops_rel,
+        "best_val_acc": best["val_acc"],
+        "best_ep": best["best_ep"],
+        "threshold": cfg["threshold"],
+        "lambda_g": lam,
+        "tau_end": cfg["tau_end"],
+        "tau_start": cfg["tau_start"],
+        "epochs": cfg["epochs"],
+        "freeze_weights": cfg.get("freeze_weights", True),
+        "use_target_open": use_target,
+        "target_open1": tgt1 if use_target else None,
+        "target_open2": tgt2 if use_target else None,
+        "alpha_target": alpha if use_target else None,
+    }
+    return out
+
+# -------------------------
+# (5) 너의 실험 구조값 넣기
+# -------------------------
+# ⚠️ 네 summary 기준으로 보통 이런 구조였음:
+# in_dim = (너 피처 수), h1=256, h2=128, out_dim=(클래스 수)
+#
+# 아래는 loader에서 자동 추정하는 방식
+xb0, yb0 = next(iter(train_loader))
+# in_dim = xb0.shape[1] # <--- REMOVED THIS INCORRECT LINE
+in_dim = INPUT_DIM # <--- ADDED THIS LINE TO USE THE GLOBAL INPUT_DIM
+# 클래스 수 추정 (y가 0..C-1)
+out_dim = int(torch.max(yb0).item() + 1)
+
+H1, H2 = 256, 128
+base_macs = dense_macs(in_dim, H1, H2, out_dim)
+
+print(f"[Auto dims] in_dim={in_dim}, out_dim={out_dim}, H1/H2={H1}/{H2}")
+print(f"[Baseline MACs/sample] {base_macs:,}")
+
+# -------------------------
+# (6) 탐색 공간 (Baseline로 끌어올리는 방향)
+# -------------------------
+grid = []
+
+# 1) threshold 낮추면 open↑ 정확도↑ (대신 FLOPs↑)
+threshold_list = [0.20, 0.25, 0.30, 0.35, 0.40]
+
+# 2) lambda_g 낮추면 덜 닫힘 → 정확도↑
+lambda_list = [3e-5, 1e-4, 3e-4, 1e-3]
+
+# 3) tau_end를 너무 낮추면 hard해져 성능 깨질 수 있음
+tau_end_list = [0.7, 0.9, 1.1]
+
+# 4) target-open 모드 (정확도 복구에 매우 강력)
+#    - L1은 최소 0.15~0.30 정도는 열리는 쪽이 안정
+target_pairs = [
+    (0.15, 0.35),
+    (0.20, 0.45),
+    (0.25, 0.55),
+]
+alpha_target = 0.5  # 너무 크면 target만 맞추고 성능이 무너질 수 있음
+
+EPOCHS = 6
+LR_GATE = 5e-2
+
+# A) 기본 sparse penalty sweep
+for th, lam, te in itertools.product(threshold_list, lambda_list, tau_end_list):
+    grid.append({
+        "threshold": th,
+        "lambda_g": lam,
+        "tau_start": 2.0,
+        "tau_end": te,
+        "epochs": EPOCHS,
+        "lr_gate": LR_GATE,
+        "freeze_weights": True,
+        "use_target_open": False,
+    })
+
+# B) target-open sweep (정확도 복구가 목표면 이게 더 잘 먹힘)
+for th, (t1,t2), te in itertools.product([0.30, 0.35, 0.40], target_pairs, [0.9, 1.1]):
+    grid.append({
+        "threshold": th,
+        "lambda_g": 1e-4,       # 너무 강한 희소화 금지
+        "tau_start": 2.0,
+        "tau_end": te,
+        "epochs": EPOCHS,
+        "lr_gate": LR_GATE,
+        "freeze_weights": True,
+        "use_target_open": True,
+        "target_open1": t1,
+        "target_open2": t2,
+        "alpha_target": alpha_target
+    })
+
+print(f"[Grid size] {len(grid)} configs")
+
+# -------------------------
+# (7) 실행
+# -------------------------
+results = []
+t0 = time.time()
+
+for i, cfg in enumerate(grid):
+    r = train_gate_model(cfg, in_dim, H1, H2, out_dim, train_loader, test_loader, base_macs) # Changed val_loader to test_loader
+    results.append(r)
+
+    if (i+1) % 10 == 0:
+        print(f"[{i+1:03d}/{len(grid)}] acc={r['acc']:.4f} flops={r['flops_rel']:.3f} open={r['open1']:.3f}/{r['open2']:.3f}")
+
+dt = time.time() - t0
+print(f"\n[Done] total={len(grid)}  time={dt:.1f}s")
+
+df = pd.DataFrame(results)
+
+# -------------------------
+# (8) 결과 정렬: 정확도 우선, FLOPs 최소
+# -------------------------
+df_sorted = df.sort_values(["acc", "flops_rel"], ascending=[False, True])
+
+print("\n===== TOP 15 (Acc desc, FLOPs asc) =====")
+display(df_sorted.head(15))
+
+# -------------------------
+# (9) Pareto frontier (최고 acc 대비 flops 최적)
+# -------------------------
+# Pareto: flops 증가할 때 acc가 증가하는 점들만 남기기
+df_p = df.sort_values("flops_rel")
+front = []
+best_acc_so_far = -1
+for _, row in df_p.iterrows():
+    if row["acc"] > best_acc_so_far:
+        front.append(row)
+        best_acc_so_far = row["acc"]
+df_front = pd.DataFrame(front)
+
+print("\n===== Pareto Frontier (acc improves as flops increases) =====")
+display(df_front)
+
+# -------------------------
+# (10) 시각화: acc vs flops
+# -------------------------
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(7,4))
+plt.scatter(df["flops_rel"], df["acc"], s=10)
+plt.scatter(df_front["flops_rel"], df_front["acc"], s=30)
+plt.axhline(y=df_sorted["acc"].max(), linestyle="--")
+plt.title("Gate sweep: test_acc vs FLOPs(rel)")
+plt.xlabel("FLOPs(rel)")
+plt.ylabel("test_acc")
+plt.tight_layout()
+plt.show()
+
+# -------------------------
+# (11) Baseline 근접 설정만 필터링
+# -------------------------
+# 목표: Baseline(48.96%) 근처. 너 baseline_acc를 정확히 알면 여기 넣으면 됨.
+baseline_target = 0.4896
+eps = 0.005  # 0.5%p 이내
+
+df_near = df[df["acc"] >= baseline_target - eps].sort_values("flops_rel")
+print(f"\n===== Near-Baseline (acc >= {baseline_target-eps:.4f}) 최소 FLOPs =====")
+display(df_near.head(10))
+
+if len(df_near) == 0:
+    print("⚠️ Baseline 근처를 만족하는 설정이 아직 없음.")
+    print("   -> threshold 더 낮추고(0.15~0.30), lambda 더 낮추고(1e-5~3e-5),")
+    print("      target_open1을 0.25~0.35로 올리면 거의 무조건 회복됩니다.")

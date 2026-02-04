@@ -1,0 +1,721 @@
+# Paper : Souce code for Speech Commands dataset 
+# this code is verified on Colab 
+
+# author : 2026. 2. 4 by Yong il Choi / 
+# Open Reseach Lab of Sorynorydotcom Co,. Ltd. 
+
+# 논문 : ５.4 Speech Commands (음성 명령 인식)
+
+# ============================================================
+# SINGLE CELL: SpeechCommands + LogMel + Baseline MLP vs DynamicGate-MLP
+# - Uses torchaudio SPEECHCOMMANDS (download if missing OR use local)
+# - Optional: HuggingFace pipeline baseline (12-label space)
+# - One cell, no duplicated code
+# ============================================================
+
+import os, sys, math, time, random, glob, subprocess
+import numpy as np
+
+# -------------------------
+# 0) (Optional) Install / Pin environment in the SAME cell
+#    - If torch/torchaudio gets reinstalled, you MUST restart runtime once.
+# -------------------------
+PIN_TORCH = True
+TORCH_VER = "2.5.1"
+TA_VER    = "2.5.1"
+CUDA_WHL_INDEX = "https://download.pytorch.org/whl/cu121"
+
+INSTALL_TRANSFORMERS = True          # needed for HF pipeline baseline
+USE_HF_PIPELINE_BASELINE = True      # set False to skip HF pipe baseline (faster)
+PIPE_MODEL_ID = "jialicheng/speech-commands_wav2vec2-base"
+
+def pip_run(args):
+    subprocess.check_call([sys.executable, "-m", "pip"] + args)
+
+def get_pkg_ver(name):
+    try:
+        from importlib import metadata as im
+        return im.version(name)
+    except Exception:
+        return None
+
+if INSTALL_TRANSFORMERS:
+    # keep lightweight deps
+    try:
+        pip_run(["-q", "install", "-U", "transformers", "accelerate", "soundfile"])
+    except Exception as e:
+        print("[WARN] transformers install failed:", e)
+
+if PIN_TORCH:
+    torch_v = get_pkg_ver("torch")
+    ta_v    = get_pkg_ver("torchaudio")
+    need_pin = (torch_v is None) or (ta_v is None) or (not str(torch_v).startswith(TORCH_VER)) or (not str(ta_v).startswith(TA_VER))
+    if need_pin:
+        print("[ENV] Reinstalling torch/torchaudio to pinned versions...")
+        # uninstall common torch family to avoid conflicts
+        try:
+            pip_run(["-q", "uninstall", "-y", "torch", "torchvision", "torchaudio", "torchtext", "torchdata", "torchao"])
+        except Exception:
+            pass
+        # install pinned wheels from cu121 index
+        pip_run(["install", "--no-cache-dir", "--index-url", CUDA_WHL_INDEX, f"torch=={TORCH_VER}", f"torchaudio=={TA_VER}"])
+        print("[ENV] Installed:")
+        print("  torch     =", get_pkg_ver("torch"))
+        print("  torchaudio=", get_pkg_ver("torchaudio"))
+        # IMPORTANT: binary wheels need runtime restart
+        raise SystemExit("✅ torch/torchaudio 재설치 완료. Colab 메뉴에서 Runtime → Restart runtime 후, 이 셀을 다시 실행하세요.")
+
+# -------------------------
+# 1) Imports (after env is stable)
+# -------------------------
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, ConcatDataset
+import torchaudio
+from torchaudio.datasets import SPEECHCOMMANDS
+
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Device:", device, "| torch:", torch.__version__, "| torchaudio:", torchaudio.__version__)
+
+# -------------------------
+# 2) Config
+# -------------------------
+SEED = 42
+random.seed(SEED); np.random.seed(SEED)
+torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.benchmark = True
+
+# Dataset root (torchaudio uses root/<speech_commands_v0.02>)
+DATA_ROOT = "/content/data_sc"  # change if you want
+DOWNLOAD_IF_MISSING = True      # if False: must already exist locally
+
+# Audio preprocessing
+TARGET_SR = 16000
+FIXED_SEC = 0.8  # 또는 FIXED_SEC = 0.8  (1.0 → 0.8) 도 같이 고려 가능
+FIXED_SAMPLES = int(TARGET_SR * FIXED_SEC)
+
+N_MELS = 40  # 64 → 40
+N_FFT = 512
+WIN_LENGTH = 400
+HOP_LENGTH = 320  # 160 → 320  (프레임 수 감소)
+POWER = 2.0
+
+# Training
+BATCH_SIZE = 256
+NUM_WORKERS = 2  # if DataLoader worker crashes, set 0
+PIN_MEMORY = True if device == "cuda" else False
+AMP = True
+
+EPOCHS_BASELINE = 8
+EPOCHS_GATE     = 10
+LR = 1e-3
+WEIGHT_DECAY = 1e-4
+
+# DynamicGate settings
+PRESET_NAME = "STATIC_STRONG_REG"  # "STATIC_STRONG_REG" or "SAMPLEWISE_STRONG_REG"
+
+PRESETS = {
+    "STATIC_STRONG_REG": dict(
+        gating_mode="static",
+        h1=512, h2=256,
+        init_p0=0.70, init_noise=0.02,
+        gate_hidden=128,
+        gate_threshold_eval=0.75,
+        tau_start=2.0, tau_end=1.0,  # 0.7 → 1.0 (조금 더 부드럽게)
+        warmup_steps=600,  # 200 → 600 (분류기 먼저 학습시키고 닫기 시작)
+        lambda_start=0.0, lambda_end=5e-3,  # 1e-2 → 5e-3 (일단 안정화)
+        target_keep=0.30,
+        reg_type="linear",   # "linear" or "mse"
+    ),
+    "SAMPLEWISE_STRONG_REG": dict(
+        gating_mode="samplewise",
+        h1=512, h2=256,
+        init_p0=0.70, init_noise=0.02,
+        gate_hidden=128,
+        gate_threshold_eval=0.80,
+        tau_start=2.0, tau_end=0.7,
+        warmup_steps=200,
+        lambda_start=0.0, lambda_end=1e-2,
+        target_keep=0.25,
+        reg_type="linear",
+    ),
+}
+CFG = PRESETS[PRESET_NAME]
+#######################
+# -------------------------
+# (ADD) DynamicGate 3-phase (epoch-based)
+# -------------------------
+GATE_PHASE1_FRAC = 0.30   # 초반 구간 비율
+GATE_PHASE2_FRAC = 0.70   # 중반 구간 끝 비율(나머지는 종반)
+
+# "열림 비율(keep)" 목표: 초반 높게 -> 중반 중간 -> 종반 낮게
+GATE_TARGET_KEEP_S1 = 0.90
+GATE_TARGET_KEEP_S2 = 0.60
+GATE_TARGET_KEEP_S3 = 0.45
+
+# eval/infer에서 hard gate 임계값(낮을수록 더 열림): 초반 낮게 -> 종반 높게
+GATE_THR_EVAL_S1 = 0.55
+GATE_THR_EVAL_S2 = 0.70
+GATE_THR_EVAL_S3 = 0.74
+
+# sparsity regularizer 강도 배수: 초반 거의 안 걸고 -> 종반 강하게
+GATE_LAM_MUL_S1 = 0.0
+GATE_LAM_MUL_S2 = 1.0
+GATE_LAM_MUL_S3 = 1.5
+
+#########################
+print("Preset:", PRESET_NAME, CFG)
+
+# Optional: add synthetic silence samples (helps if using 12-label pipe space)
+ADD_SYNTH_SILENCE = True
+
+# HF pipe baseline eval options
+PIPE_EVAL_EVERY_EPOCH = 1
+PIPE_MAX_ITEMS_VAL  = 1500
+PIPE_MAX_ITEMS_TEST = 3000
+PIPE_BATCH = 32
+
+# -------------------------
+# 3) HF Pipeline (optional)
+# -------------------------
+PIPE_LABELS = None
+label2id = None
+num_classes = None
+
+if USE_HF_PIPELINE_BASELINE:
+    from transformers import pipeline
+    pipe_device = 0 if device == "cuda" else -1
+    print("[HF] Loading pipeline:", PIPE_MODEL_ID, "| device:", pipe_device)
+    pipe = pipeline("audio-classification", model=PIPE_MODEL_ID, device=pipe_device)
+
+    _id2label = pipe.model.config.id2label
+    PIPE_LABELS = [_id2label[k] for k in sorted(_id2label, key=lambda x: int(x))]
+    PIPE_LABEL_SET = set(PIPE_LABELS)
+    label2id = {lab: i for i, lab in enumerate(PIPE_LABELS)}
+    num_classes = len(PIPE_LABELS)
+    print("[pipe] labels:", PIPE_LABELS)
+else:
+    pipe = None
+
+def map_to_pipe_label(raw_label: str) -> str:
+    # if pipe baseline enabled -> map SpeechCommands labels to pipe label set (unknown -> _unknown_)
+    if PIPE_LABELS is None:
+        return raw_label
+    return raw_label if raw_label in PIPE_LABEL_SET else "_unknown_"
+
+# -------------------------
+# 4) SpeechCommands dataset (download OR local)
+# -------------------------
+os.makedirs(DATA_ROOT, exist_ok=True)
+DATASET_DIR = os.path.join(DATA_ROOT, "speech_commands_v0.02")
+if (not os.path.isdir(DATASET_DIR)) and (not DOWNLOAD_IF_MISSING):
+    raise RuntimeError(f"Local dataset not found: {DATASET_DIR} (set DOWNLOAD_IF_MISSING=True or fix DATA_ROOT)")
+
+class SubsetSC(SPEECHCOMMANDS):
+    def __init__(self, subset: str, root=DATA_ROOT, download=False):
+        super().__init__(root=root, download=download)
+
+        def load_list(filename):
+            filepath = os.path.join(self._path, filename)
+            with open(filepath) as f:
+                return [os.path.normpath(os.path.join(self._path, line.strip())) for line in f]
+
+        if subset == "validation":
+            self._walker = load_list("validation_list.txt")
+        elif subset == "testing":
+            self._walker = load_list("testing_list.txt")
+        elif subset == "training":
+            excludes = set(load_list("validation_list.txt") + load_list("testing_list.txt"))
+            self._walker = [w for w in self._walker if w not in excludes]
+        else:
+            raise ValueError("subset must be one of: training, validation, testing")
+
+# first call: download only if missing
+download_flag = DOWNLOAD_IF_MISSING and (not os.path.isdir(DATASET_DIR))
+train_ds = SubsetSC("training",   download=download_flag)
+val_ds   = SubsetSC("validation", download=False)
+test_ds  = SubsetSC("testing",    download=False)
+
+print("Raw sizes:", len(train_ds), len(val_ds), len(test_ds))
+
+# add synthetic silence to match pipe label space
+class SilenceDS(Dataset):
+    def __init__(self, n_samples: int, sr: int, n: int):
+        self.n = int(n_samples); self.sr = int(sr); self.L = int(n)
+    def __len__(self): return self.n
+    def __getitem__(self, idx):
+        wav = torch.zeros(self.L, dtype=torch.float32)
+        return wav.unsqueeze(0), self.sr, "_silence_", "sil", idx
+
+if ADD_SYNTH_SILENCE and (USE_HF_PIPELINE_BASELINE and ("_silence_" in label2id)):
+    sil_train = SilenceDS(n_samples=max(2000, len(train_ds)//50), sr=TARGET_SR, n=FIXED_SAMPLES)
+    sil_val   = SilenceDS(n_samples=300, sr=TARGET_SR, n=FIXED_SAMPLES)
+    sil_test  = SilenceDS(n_samples=300, sr=TARGET_SR, n=FIXED_SAMPLES)
+    train_ds = ConcatDataset([train_ds, sil_train])
+    val_ds   = ConcatDataset([val_ds, sil_val])
+    test_ds  = ConcatDataset([test_ds, sil_test])
+    print("Mixed(silence) sizes:", len(train_ds), len(val_ds), len(test_ds))
+
+# If not using pipe label space, we train on native folder labels (35-ish)
+if not USE_HF_PIPELINE_BASELINE:
+    # build label list from folder structure
+    labs = []
+    for d in os.listdir(DATASET_DIR):
+        p = os.path.join(DATASET_DIR, d)
+        if os.path.isdir(p) and (not d.startswith("_")) and (d != "_background_noise_"):
+            labs.append(d)
+    labs = sorted(labs)
+    PIPE_LABELS = labs
+    label2id = {l:i for i,l in enumerate(PIPE_LABELS)}
+    num_classes = len(PIPE_LABELS)
+    print("[native] num_classes:", num_classes)
+
+# -------------------------
+# 5) Log-Mel vector featurizer (fixed length)
+# -------------------------
+mel = torchaudio.transforms.MelSpectrogram(
+    sample_rate=TARGET_SR,
+    n_fft=N_FFT,
+    win_length=WIN_LENGTH,
+    hop_length=HOP_LENGTH,
+    n_mels=N_MELS,
+    power=POWER,
+)
+to_db = torchaudio.transforms.AmplitudeToDB(stype="power")
+
+with torch.no_grad():
+    dummy = torch.zeros(FIXED_SAMPLES)
+    m = to_db(mel(dummy))  # [n_mels, frames]
+    FIXED_FRAMES = m.shape[-1]
+
+in_dim = N_MELS * FIXED_FRAMES
+print("FIXED_FRAMES:", FIXED_FRAMES, "| in_dim:", in_dim)
+
+_resampler_cache = {}
+def preprocess_waveform_fixed(waveform, sr):
+    if waveform.dim() == 2:
+        waveform = waveform.squeeze(0)
+    if sr != TARGET_SR:
+        key = int(sr)
+        if key not in _resampler_cache:
+            _resampler_cache[key] = torchaudio.transforms.Resample(orig_freq=sr, new_freq=TARGET_SR)
+        waveform = _resampler_cache[key](waveform)
+    T = waveform.numel()
+    if T < FIXED_SAMPLES:
+        pad = torch.zeros(FIXED_SAMPLES - T, dtype=waveform.dtype)
+        waveform = torch.cat([waveform, pad], dim=0)
+    else:
+        waveform = waveform[:FIXED_SAMPLES]
+    return waveform
+
+def preprocess_waveform_logmel_vec(waveform, sr):
+    w = preprocess_waveform_fixed(waveform, sr)
+    M = to_db(mel(w))  # [n_mels, frames]
+    fT = M.shape[-1]
+    if fT < FIXED_FRAMES:
+        pad = torch.zeros(N_MELS, FIXED_FRAMES - fT, dtype=M.dtype)
+        M = torch.cat([M, pad], dim=1)
+    else:
+        M = M[:, :FIXED_FRAMES]
+    # per-sample norm
+    M = (M - M.mean()) / (M.std() + 1e-5)
+    return M.reshape(-1).float()
+
+def collate_sc(batch):
+    xs, ys = [], []
+    for waveform, sr, raw_label, *_ in batch:
+        x = preprocess_waveform_logmel_vec(waveform, sr)
+        lab = map_to_pipe_label(raw_label) if USE_HF_PIPELINE_BASELINE else raw_label
+        if lab not in label2id:
+            lab = "_unknown_" if "_unknown_" in label2id else list(label2id.keys())[0]
+        xs.append(x)
+        ys.append(label2id[lab])
+    X = torch.stack(xs, dim=0)
+    Y = torch.tensor(ys, dtype=torch.long)
+    return X, Y
+
+train_loader = DataLoader(
+    train_ds, batch_size=BATCH_SIZE, shuffle=True,
+    num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
+    collate_fn=collate_sc, persistent_workers=(NUM_WORKERS > 0),
+)
+val_loader = DataLoader(
+    val_ds, batch_size=BATCH_SIZE, shuffle=False,
+    num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
+    collate_fn=collate_sc, persistent_workers=(NUM_WORKERS > 0),
+)
+test_loader = DataLoader(
+    test_ds, batch_size=BATCH_SIZE, shuffle=False,
+    num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
+    collate_fn=collate_sc, persistent_workers=(NUM_WORKERS > 0),
+)
+
+# -------------------------
+# 6) Helpers
+# -------------------------
+def exp_schedule_safe(step, start_step, end_step, start_val, end_val):
+    step = max(step, start_step)
+    end_step = max(end_step, start_step + 1)
+    t = (step - start_step) / (end_step - start_step)
+    t = min(max(t, 0.0), 1.0)
+    if start_val <= 0 or end_val <= 0:
+        return start_val + (end_val - start_val) * t
+    return start_val * ((end_val / start_val) ** t)
+
+def ste_bernoulli_gate(p):
+    hard = torch.bernoulli(p)
+    return (hard - p).detach() + p
+
+def estimate_macs(in_dim, h1, h2, out_dim, g1_ratio, g2_ratio):
+    baseline = in_dim*h1 + h1*h2 + h2*out_dim
+    gated = in_dim*h1 + (h1*g1_ratio)*h2 + (h2*g2_ratio)*out_dim
+    return baseline, gated, (gated / max(baseline, 1.0))
+
+# -------------------------
+# 7) Models
+# -------------------------
+class BaselineMLP(nn.Module):
+    def __init__(self, in_dim, out_dim, h1, h2):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, h1)
+        self.fc2 = nn.Linear(h1, h2)
+        self.fc3 = nn.Linear(h2, out_dim)
+    def forward(self, x):
+        h1 = F.relu(self.fc1(x))
+        h2 = F.relu(self.fc2(h1))
+        return self.fc3(h2)
+
+class DynamicGateMLP(nn.Module):
+    def __init__(self, in_dim, out_dim, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.h1 = cfg["h1"]; self.h2 = cfg["h2"]
+        self.fc1 = nn.Linear(in_dim, self.h1)
+        self.fc2 = nn.Linear(self.h1, self.h2)
+        self.fc3 = nn.Linear(self.h2, out_dim)
+
+        self.gate_threshold = float(cfg["gate_threshold_eval"])
+        mode = cfg["gating_mode"]
+
+        if mode == "static":
+            self.gate_logit1 = nn.Parameter(torch.zeros(self.h1))
+            self.gate_logit2 = nn.Parameter(torch.zeros(self.h2))
+            with torch.no_grad():
+                self.gate_logit1.add_(torch.randn_like(self.gate_logit1) * cfg["init_noise"])
+                self.gate_logit2.add_(torch.randn_like(self.gate_logit2) * cfg["init_noise"])
+        elif mode == "samplewise":
+            gh = int(cfg["gate_hidden"])
+            self.gnet1 = nn.Sequential(nn.Linear(self.h1, gh), nn.ReLU(), nn.Linear(gh, self.h1))
+            self.gnet2 = nn.Sequential(nn.Linear(self.h2, gh), nn.ReLU(), nn.Linear(gh, self.h2))
+            self.gate_bias1 = nn.Parameter(torch.zeros(self.h1))
+            self.gate_bias2 = nn.Parameter(torch.zeros(self.h2))
+            with torch.no_grad():
+                self.gate_bias1.add_(torch.randn_like(self.gate_bias1) * cfg["init_noise"])
+                self.gate_bias2.add_(torch.randn_like(self.gate_bias2) * cfg["init_noise"])
+        else:
+            raise ValueError("gating_mode must be 'static' or 'samplewise'")
+
+    def init_gate_logits(self, p0=0.7):
+        p0 = float(p0)
+        p0 = min(max(p0, 1e-4), 1-1e-4)
+        logit = math.log(p0/(1-p0))
+        with torch.no_grad():
+            if self.cfg["gating_mode"] == "static":
+                self.gate_logit1.fill_(logit)
+                self.gate_logit2.fill_(logit)
+            else:
+                self.gate_bias1.fill_(logit)
+                self.gate_bias2.fill_(logit)
+
+    def forward(self, x, tau=1.0, return_gates=False):
+        h1 = F.relu(self.fc1(x))
+
+        if self.cfg["gating_mode"] == "static":
+            p1 = torch.sigmoid(self.gate_logit1 / max(tau, 1e-6))
+            p1_b = p1.unsqueeze(0).expand(h1.size(0), -1)
+        else:
+            logit1 = self.gnet1(h1) + self.gate_bias1
+            p1_b = torch.sigmoid(logit1 / max(tau, 1e-6))
+            p1 = p1_b.mean(dim=0)
+
+        if self.training:
+            g1_b = ste_bernoulli_gate(p1_b)
+        else:
+            g1_b = (p1_b > self.gate_threshold).float()
+
+        h1g = h1 * g1_b
+        h2 = F.relu(self.fc2(h1g))
+
+        if self.cfg["gating_mode"] == "static":
+            p2 = torch.sigmoid(self.gate_logit2 / max(tau, 1e-6))
+            p2_b = p2.unsqueeze(0).expand(h2.size(0), -1)
+        else:
+            logit2 = self.gnet2(h2) + self.gate_bias2
+            p2_b = torch.sigmoid(logit2 / max(tau, 1e-6))
+            p2 = p2_b.mean(dim=0)
+
+        if self.training:
+            g2_b = ste_bernoulli_gate(p2_b)
+        else:
+            g2_b = (p2_b > self.gate_threshold).float()
+
+        h2g = h2 * g2_b
+        logits = self.fc3(h2g)
+
+        if return_gates:
+            return logits, (p1_b, p2_b), (g1_b.detach(), g2_b.detach())
+        return logits
+
+def gate_regularizer(p1_b, p2_b, cfg, lam: float, target_keep=None):
+    keep1 = p1_b.mean()
+    keep2 = p2_b.mean()
+
+    tgt = float(cfg["target_keep"] if target_keep is None else target_keep)
+
+
+    if cfg["reg_type"] == "linear":
+        over1 = F.relu(keep1 - tgt)
+        over2 = F.relu(keep2 - tgt)
+        loss_gate = lam * (over1 + over2)
+    elif cfg["reg_type"] == "mse":
+        loss_gate = lam * ((keep1 - tgt)**2 + (keep2 - tgt)**2)
+    else:
+        raise ValueError("reg_type must be 'linear' or 'mse'")
+
+    return loss_gate, float(keep1.item()), float(keep2.item())
+
+# -------------------------
+# 8) Evaluation
+# -------------------------
+@torch.no_grad()
+def evaluate_model(model, loader, is_gate=False):
+    model.eval()
+    correct, total = 0, 0
+    p1_list, p2_list, g1_list, g2_list = [], [], [], []
+
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        if is_gate:
+            logits, (p1_b, p2_b), (g1_b, g2_b) = model(x, tau=1.0, return_gates=True)
+            p1_list.append(float(p1_b.mean().item()))
+            p2_list.append(float(p2_b.mean().item()))
+            g1_list.append(float(g1_b.float().mean().item()))
+            g2_list.append(float(g2_b.float().mean().item()))
+        else:
+            logits = model(x)
+
+        pred = logits.argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.numel()
+
+    acc = correct / max(total, 1)
+    stats = None
+    if is_gate:
+        stats = {
+            "p1": float(np.mean(p1_list)), "p2": float(np.mean(p2_list)),
+            "g1": float(np.mean(g1_list)), "g2": float(np.mean(g2_list)),
+        }
+    return acc, stats
+
+@torch.no_grad()
+def evaluate_pipe_on_dataset(ds, max_items=2000, batch_size=32):
+    if pipe is None:
+        return None
+
+    correct, total = 0, 0
+    inputs, gts = [], []
+
+    n = min(len(ds), int(max_items)) if max_items is not None else len(ds)
+    for i in range(n):
+        waveform, sr, raw_label, *_ = ds[i]
+        w = preprocess_waveform_fixed(waveform, sr)
+        lab = map_to_pipe_label(raw_label)
+        gt = label2id.get(lab, label2id.get("_unknown_", 0))
+
+        inputs.append({"array": w.numpy().astype(np.float32), "sampling_rate": TARGET_SR})
+        gts.append(gt)
+
+        if len(inputs) == batch_size:
+            out = pipe(inputs, top_k=1)
+            for o, gt_id in zip(out, gts):
+                pred_lab = o["label"] if isinstance(o, dict) else o[0]["label"]
+                pred_id = label2id.get(pred_lab, label2id.get("_unknown_", 0))
+                correct += int(pred_id == gt_id)
+                total += 1
+            inputs, gts = [], []
+
+    if len(inputs) > 0:
+        out = pipe(inputs, top_k=1)
+        for o, gt_id in zip(out, gts):
+            pred_lab = o["label"] if isinstance(o, dict) else o[0]["label"]
+            pred_id = label2id.get(pred_lab, label2id.get("_unknown_", 0))
+            correct += int(pred_id == gt_id)
+            total += 1
+
+    return correct / max(total, 1)
+
+# -------------------------
+# 9) Train: Baseline
+# -------------------------
+def train_baseline():
+    model = BaselineMLP(in_dim, num_classes, CFG["h1"], CFG["h2"]).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scaler = torch.cuda.amp.GradScaler(enabled=(AMP and device == "cuda"))
+
+    t0 = time.time()
+    best_val = 0.0
+
+    for ep in range(1, EPOCHS_BASELINE + 1):
+        model.train()
+        for x, y in train_loader:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            with torch.cuda.amp.autocast(enabled=(AMP and device == "cuda")):
+                logits = model(x)
+                loss = F.cross_entropy(logits, y)
+
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+
+        val_acc, _ = evaluate_model(model, val_loader, is_gate=False)
+        best_val = max(best_val, val_acc)
+        elapsed = time.time() - t0
+        print(f"[Baseline] ep {ep:02d}/{EPOCHS_BASELINE} val_acc={val_acc:.4f} best={best_val:.4f} time={elapsed:.1f}s")
+
+    test_acc, _ = evaluate_model(model, test_loader, is_gate=False)
+    baseline_macs, _, _ = estimate_macs(in_dim, CFG["h1"], CFG["h2"], num_classes, 1.0, 1.0)
+
+    print("\n=== FINAL TEST (Baseline) ===")
+    print("test_acc:", test_acc)
+    print("MACs (baseline):", f"{baseline_macs:,}")
+    return model, test_acc
+
+# -------------------------
+# 10) Train: DynamicGate
+# -------------------------
+def train_dynamicgate():
+    model = DynamicGateMLP(in_dim, num_classes, CFG).to(device)
+    model.init_gate_logits(p0=CFG["init_p0"])
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scaler = torch.cuda.amp.GradScaler(enabled=(AMP and device == "cuda"))
+
+    global_step = 0
+    steps_total = len(train_loader) * EPOCHS_GATE
+    t0 = time.time()
+
+# ---- (ADD) epoch phase boundaries ----
+    e1 = max(1, int(round(GATE_PHASE1_FRAC * EPOCHS_GATE)))
+    e2 = max(e1 + 1, int(round(GATE_PHASE2_FRAC * EPOCHS_GATE)))
+
+    def phase_params(ep):
+        # returns: (target_keep, eval_threshold, lambda_multiplier)
+        if ep <= e1:
+            return GATE_TARGET_KEEP_S1, GATE_THR_EVAL_S1, GATE_LAM_MUL_S1
+        elif ep <= e2:
+            return GATE_TARGET_KEEP_S2, GATE_THR_EVAL_S2, GATE_LAM_MUL_S2
+        else:
+            return GATE_TARGET_KEEP_S3, GATE_THR_EVAL_S3, GATE_LAM_MUL_S3
+
+
+
+
+    if USE_HF_PIPELINE_BASELINE:
+        pipe_val0 = evaluate_pipe_on_dataset(val_ds, max_items=PIPE_MAX_ITEMS_VAL, batch_size=PIPE_BATCH)
+        print(f"[pipe] val_acc (mapped, n={PIPE_MAX_ITEMS_VAL}) = {pipe_val0:.4f}")
+
+    for ep in range(1, EPOCHS_GATE + 1):
+  # ---- (ADD) 3-phase 설정 ----
+        target_keep_ep, thr_eval_ep, lam_mul = phase_params(ep)
+
+ # eval/infer hard-threshold를 epoch에 따라 변화 (초반 많이 열고, 종반 닫힘)
+        model.gate_threshold = float(thr_eval_ep)
+
+
+        model.train()
+        for x, y in train_loader:
+            global_step += 1
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            tau = exp_schedule_safe(global_step, 1, steps_total, CFG["tau_start"], CFG["tau_end"])
+            lam = 0.0 if global_step < CFG["warmup_steps"] else exp_schedule_safe(
+                global_step, CFG["warmup_steps"], steps_total, CFG["lambda_start"], CFG["lambda_end"]
+            )
+            lam = lam * lam_mul  # ✅ phase별로 sparsity 강도 조절
+
+            with torch.cuda.amp.autocast(enabled=(AMP and device == "cuda")):
+                logits, (p1_b, p2_b), _ = model(x, tau=tau, return_gates=True)
+                loss_task = F.cross_entropy(logits, y)
+                loss_gate, keep1, keep2 = gate_regularizer(
+                   # p1_b, p2_b, CFG, lam
+                    p1_b, p2_b, CFG, lam, target_keep=target_keep_ep  # ✅ phase별 target_keep
+                )
+                loss = loss_task + loss_gate
+
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+
+        val_acc, gs = evaluate_model(model, val_loader, is_gate=True)
+        base_macs, gated_macs, rel = estimate_macs(in_dim, CFG["h1"], CFG["h2"], num_classes, gs["g1"], gs["g2"])
+        elapsed = time.time() - t0
+
+# ---- (CHG) 로그에 phase 정보 포함 ----
+        msg = (
+            f"[Gate] ep {ep:02d}/{EPOCHS_GATE} val_acc={val_acc:.4f} "
+            f"(phase_keep={target_keep_ep:.2f}, thr_eval={thr_eval_ep:.2f}, lam_mul={lam_mul:.1f}) "
+            f"val_acc={val_acc:.4f} "
+            f"p1={gs['p1']:.3f}, g1={gs['g1']:.3f} | "
+            f"p2={gs['p2']:.3f}, g2={gs['g2']:.3f} | "
+            f"RelMAC={rel:.3f} time={elapsed:.1f}s"
+        )
+
+        if USE_HF_PIPELINE_BASELINE and (ep % PIPE_EVAL_EVERY_EPOCH == 0):
+            pipe_val = evaluate_pipe_on_dataset(val_ds, max_items=PIPE_MAX_ITEMS_VAL, batch_size=PIPE_BATCH)
+            msg += f" | pipe_val_acc={pipe_val:.4f}"
+
+        print(msg)
+
+    # ---- (ADD) 종반 threshold 확정 후 최종 평가(닫힌 상태로 test) ----
+    model.gate_threshold = float(GATE_THR_EVAL_S3)
+
+    test_acc, gs = evaluate_model(model, test_loader, is_gate=True)
+    base_macs, gated_macs, rel = estimate_macs(in_dim, CFG["h1"], CFG["h2"], num_classes, gs["g1"], gs["g2"])
+
+    print("\n=== FINAL TEST (DynamicGate) ===")
+    print("test_acc:", test_acc)
+    print("Gate stats:", gs)
+    print(f"MACs baseline={base_macs:,} | gated~={int(gated_macs):,} | rel={rel:.3f}")
+
+    if USE_HF_PIPELINE_BASELINE:
+        pipe_test = evaluate_pipe_on_dataset(test_ds, max_items=PIPE_MAX_ITEMS_TEST, batch_size=PIPE_BATCH)
+        print(f"[pipe] test_acc (mapped, n={PIPE_MAX_ITEMS_TEST}) = {pipe_test:.4f}")
+
+    return model, test_acc, gs
+
+# -------------------------
+# 11) Run all
+# -------------------------
+print("\n================ RUN: Baseline ================")
+baseline_model, baseline_test = train_baseline()
+
+print("\n================ RUN: DynamicGate ================")
+gate_model, gate_test, gate_stats = train_dynamicgate()
+
+print("\n================ SUMMARY ================")
+print("Baseline  test_acc:", baseline_test)
+print("Gate      test_acc:", gate_test)
+if gate_stats is not None:
+    _, _, rel = estimate_macs(in_dim, CFG["h1"], CFG["h2"], num_classes, gate_stats["g1"], gate_stats["g2"])
+    print("Gate open rates: g1=%.3f g2=%.3f | RelMAC=%.3f" % (gate_stats["g1"], gate_stats["g2"], rel))
+print("Done.")

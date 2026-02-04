@@ -1,0 +1,1384 @@
+# Paper : Souce code for PBMC3k dataset 
+# this code is verified on Colab 
+
+# author : 2026. 2. 4 by Yong il Choi / 
+# Open Reseach Lab of Sorynorydotcom Co,. Ltd. 
+
+# 논문 PBMC3k : 유전자데이터셋 
+
+# PBMC3k (Scanpy) Leiden-label Classification
+# Baseline / Dropout / Pruned / DynamicGate / DynamicGate+RigL
+# - RAM-safe (CSR 유지, batch에서만 densify)
+# - Per-seed stratified split + (train/val/test) 모든 클래스 존재 보장
+# - Per-seed class-weight (TRAIN에서만 계산)
+# - Mean±Std summary + MACs-Accuracy Pareto plot (올바른 Pareto front)
+# - ✅ DynamicGate: 3-구간 스케줄(초기=열기, 중기=절반, 말기=닫기) + (선택) dual-λ 자동조절
+
+# 5차시도,, 왜 gate 계속 1일까? 이거 해결하기
+
+# ============================================================
+# PBMC3k (Scanpy) Leiden-label Classification
+# Baseline / Dropout / Pruned / DynamicGate / DynamicGate+RigL
+# - RAM-safe (CSR 유지, batch에서만 densify)
+# - Per-seed stratified split + (train/val/test) 모든 클래스 존재 보장
+# - Per-seed class-weight (TRAIN에서만 계산)
+# - Mean±Std summary + MACs-Accuracy Pareto plot (올바른 Pareto front)
+# - DynamicGate: 3-phase target schedule + sparsity-aware checkpoint
+# ============================================================
+
+# -------------------------
+# 0) Install (Colab)
+# -------------------------
+!pip -q install scanpy anndata leidenalg igraph umap-learn scikit-misc
+!pip -q install scipy pandas scikit-learn psutil
+import os, gc, time, math, copy, random
+import numpy as np
+import pandas as pd
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.nn.utils import prune
+from torch.utils.data import DataLoader, Dataset
+
+import scanpy as sc
+from scipy import sparse
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, precision_recall_fscore_support
+
+import matplotlib.pyplot as plt
+
+# -------------------------
+# 9) Config
+# -------------------------
+# Data / labels
+N_HVG = 2000
+LEIDEN_RES = 0.6
+MIN_CLUSTER = 30
+
+# split
+TEST_SIZE = 0.2
+VAL_SIZE = 0.1
+
+# train
+BASE_BATCH = 256
+EPOCHS = 10
+LR = 2e-3
+WEIGHT_DECAY = 1e-4
+DROPOUT_P = 0.2
+
+# ===== Class-weight (호출부 숫자 제거용) =====
+CLASS_WEIGHT_CLIP_MAX = 20.0   # compute_class_weights_from_train(..., clip_max=20.0)
+
+# prune
+PRUNE_AMOUNT = 0.5
+PRUNE_FT_EPOCHS = 3
+PRUNE_FT_LR_MULT  = 0.5        # Pruned-FT에서 lr=LR*0.5
+
+# DynamicGate 핵심 파라미터(절감 유도)
+# - p0는 초반 “열림” 안정화
+# - 이후 3-phase target + thr/tau 스케줄로 닫힘 유도
+GATE_P0 = 0.85 # 0.95 # 0.6
+GATE_RANK1 = 32
+GATE_RANK2 = 32
+TAU_HI, TAU_LO = 4.0, 0.20     # 0.5    # 2.5, 0.5
+GATE_THR_WARM, GATE_THR_FINAL = 0.45, 0.97 #  0.5, 0.98  #  0.5, 0.90        # 0.15, 0.75
+LAMBDA_G = 3e-1  #B) 절감형,   C)acc는 깨저도됨, 강제 디버그형  1.0(debug) # 1e-1  # 1e-2 (절감율이  ) # 5e-3
+GATE_WARMUP_EPOCHS = 1 # debug: 0 # 2   # 1
+
+# 3-phase targets
+PHASE1_FRAC = 0.20 # debug= 0.30
+PHASE2_FRAC = 0.60 # debug= 0.70
+T1_S1, T2_S1 = 0.90, 0.85 #  0.95, 0.80
+T1_S2, T2_S2 = 0.25, 0.20 # debg= acc 깨져도되는 설정 => 0.40, 0.25 # 0.55, 0.35
+T1_S3, T2_S3 = 0.05, 0.03 # debug, acc 깨조도 되는 설정 => 0.02, 0.01 # 0.10, 0.05 # 0.25, 0.15
+
+# sparsity-aware ckpt
+F1_EPS = 0.20
+# ===== Gate stats / Open-rate estimate (호출부 숫자 제거용) =====
+GATE_STATS_MAX_BATCHES = 10   # quick_gate_stats(..., max_batches=10)
+OPENRATE_MAX_BATCHES   = 50   # estimate_open_rates_dynamic_any(..., max_batches=50)
+
+
+# RigL
+RIGL_DENSITY1 = 0.25
+RIGL_DENSITY2 = 0.25
+RIGL_DELTA = 0.05
+RIGL_INTERVAL = 400
+INIT_SCALE = 0.02
+
+# seeds
+SEEDS = list(range(42, 52))  # 10개
+
+def auto_batch_size(in_dim, base=256):
+    if in_dim > 80000: return min(base, 16)
+    if in_dim > 50000: return min(base, 32)
+    if in_dim > 20000: return min(base, 64)
+    return base
+
+
+# -------------------------
+# 1) Utilities
+# -------------------------
+def _ram_gb():
+    try:
+        import psutil
+        p = psutil.Process(os.getpid())
+        return p.memory_info().rss / 1024**3
+    except Exception:
+        return float("nan")
+
+def ram(msg):
+    gc.collect()
+    print(f"[RAM] {msg}: {_ram_gb():.2f} GB")
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+# RigL global grad store (clear per-seed to avoid CPU leak)
+import itertools
+_DENSE_GRAD_STORE = {}
+_HANDLE_COUNTER = itertools.count()
+
+def cleanup():
+    gc.collect()
+    _DENSE_GRAD_STORE.clear()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+# alias (네가 중간에 cleanup_cuda()로 호출하던 것 방지)
+cleanup_cuda = cleanup
+
+# -------------------------
+# 2) Data Loader: PBMC3k -> Leiden labels
+# -------------------------
+def load_pbmc3k_leiden(
+    n_hvg=2000,
+    resolution=0.6,
+    min_cluster_size=30,
+    seed=0,
+):
+    """
+    Returns:
+      adata: AnnData (HVG subset)
+      X: CSR float32
+      y: int64 (codes of adata.obs['label'])
+      class_names: list of category names
+    """
+    adata = sc.datasets.pbmc3k()  # downloads if needed
+
+    # Normalize / log1p
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+
+    # HVG subset
+    sc.pp.highly_variable_genes(
+        adata, n_top_genes=n_hvg, flavor="seurat_v3", subset=True
+    )
+
+    # PCA / neighbors / leiden
+    sc.pp.pca(adata, n_comps=50, svd_solver="arpack", random_state=seed)
+    sc.pp.neighbors(adata, n_neighbors=15, n_pcs=50)
+    sc.tl.leiden(adata, resolution=resolution, key_added="label", random_state=seed)
+
+    # Merge tiny clusters -> "rare"
+    lab = adata.obs["label"].astype(str)
+    counts = lab.value_counts()
+    rare = counts[counts < min_cluster_size].index
+    if len(rare) > 0:
+        lab = lab.where(~lab.isin(rare), other="rare")
+    adata.obs["label"] = pd.Categorical(lab)
+
+    # Export X,y
+    X = adata.X.tocsr() if sparse.issparse(adata.X) else sparse.csr_matrix(adata.X)
+    if X.dtype != np.float32:
+        X = X.astype(np.float32)
+
+    y_cat = adata.obs["label"].astype("category")
+    y = y_cat.cat.codes.to_numpy(dtype=np.int64)
+    class_names = list(y_cat.cat.categories)
+    return adata, X, y, class_names
+
+def stratified_split_all_classes(y, test_size=0.2, val_size=0.1, seed=42, max_tries=300):
+    """
+    Stratified split + train/val/test 각각에 모든 클래스가 1개 이상 포함되도록 보장.
+    """
+    idx = np.arange(len(y))
+    rng = np.random.default_rng(seed)
+    n_classes = int(y.max()) + 1
+
+    for _ in range(max_tries):
+        rs1 = int(rng.integers(1_000_000_000))
+        tr_idx, te_idx = train_test_split(idx, test_size=test_size, random_state=rs1, stratify=y)
+
+        val_ratio = val_size / (1.0 - test_size)
+        rs2 = int(rng.integers(1_000_000_000))
+        tr_idx2, va_idx = train_test_split(tr_idx, test_size=val_ratio, random_state=rs2, stratify=y[tr_idx])
+
+        ok = True
+        for part in (tr_idx2, va_idx, te_idx):
+            c = np.bincount(y[part], minlength=n_classes)
+            if (c == 0).any():
+                ok = False
+                break
+        if ok:
+            return tr_idx2, va_idx, te_idx
+
+    raise RuntimeError("Could not split with all classes present. Try lowering resolution or min_cluster_size.")
+
+# -------------------------
+# 3) Dataset / Loader (densify only in batch)
+# -------------------------
+class IndexDataset(Dataset):
+    def __init__(self, indices, y):
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.y = y
+    def __len__(self):
+        return len(self.indices)
+    def __getitem__(self, i):
+        idx = int(self.indices[i])
+        return idx, self.y[idx]
+
+def make_collate_fn(X_csr):
+    def collate(batch):
+        idxs = np.array([b[0] for b in batch], dtype=np.int64)
+        yb   = np.array([b[1] for b in batch], dtype=np.int64)
+        Xb = X_csr[idxs].toarray()       # batch에서만 densify
+        xb = torch.from_numpy(Xb)        # float32
+        yb_t = torch.from_numpy(yb)      # int64
+        return xb, yb_t
+    return collate
+
+# -------------------------
+# 4) Eval / class-weight
+# -------------------------
+@torch.no_grad()
+def evaluate(model, loader, class_names=None, detail=False):
+    model.eval()
+    ys, ps = [], []
+    for xb, yb in loader:
+        xb = xb.to(device, non_blocking=True)
+        out = model(xb)
+        pred = torch.argmax(out, dim=-1)
+        ys.append(yb.numpy())
+        ps.append(pred.detach().cpu().numpy())
+
+    y_true = np.concatenate(ys)
+    y_pred = np.concatenate(ps)
+
+    acc = accuracy_score(y_true, y_pred) * 100.0
+    micro_f1 = f1_score(y_true, y_pred, average="micro") * 100.0
+    macro_f1 = f1_score(y_true, y_pred, average="macro") * 100.0
+    metrics = {"acc": acc, "micro_f1": micro_f1, "macro_f1": macro_f1}
+
+    if detail and class_names is not None:
+        pr, rc, f1s, sup = precision_recall_fscore_support(
+            y_true, y_pred, labels=np.arange(len(class_names)), zero_division=0
+        )
+        per_class = {}
+        for i, name in enumerate(class_names):
+            per_class[name] = {
+                "precision": float(pr[i] * 100.0),
+                "recall":    float(rc[i] * 100.0),
+                "f1":        float(f1s[i] * 100.0),
+                "support":   int(sup[i]),
+            }
+        metrics["per_class"] = per_class
+        cm = confusion_matrix(y_true, y_pred, labels=np.arange(len(class_names)))
+        metrics["confusion_matrix"] = cm
+
+    return metrics
+
+def compute_class_weights_from_train(y_train, num_classes, mode="balanced", clip_max=CLASS_WEIGHT_CLIP_MAX):
+    counts = np.bincount(y_train, minlength=num_classes).astype(np.float64)
+    N = counts.sum()
+    K = num_classes
+    if mode == "balanced":
+        w = N / (K * np.maximum(counts, 1.0))
+    elif mode == "inv":
+        w = 1.0 / np.maximum(counts, 1.0)
+        w = w * (K / w.sum())
+    elif mode == "sqrt_inv":
+        w = 1.0 / np.sqrt(np.maximum(counts, 1.0))
+        w = w * (K / w.sum())
+    else:
+        raise ValueError("Unknown mode")
+    if clip_max is not None:
+        w = np.minimum(w, float(clip_max))
+    return w.astype(np.float32)
+
+def make_loss_fn(class_weights_t: torch.Tensor):
+    return nn.CrossEntropyLoss(weight=class_weights_t)
+
+# -------------------------
+# 5) Models
+# -------------------------
+def choose_widths(in_dim):
+    h1 = min(1024, max(256, in_dim // 2))
+    h2 = min(512,  max(128, h1 // 2))
+    return h1, h2
+
+class MLP(nn.Module):
+    def __init__(self, in_dim, h1, h2, out_dim, dropout=0.0):
+        super().__init__()
+        self.ln0 = nn.LayerNorm(in_dim)
+        self.fc1 = nn.Linear(in_dim, h1)
+        self.fc2 = nn.Linear(h1, h2)
+        self.fc3 = nn.Linear(h2, out_dim)
+        self.dropout = float(dropout)
+
+    def forward(self, x):
+        x = self.ln0(x)
+        x = F.gelu(self.fc1(x))
+        if self.dropout > 0: x = F.dropout(x, p=self.dropout, training=self.training)
+        x = F.gelu(self.fc2(x))
+        if self.dropout > 0: x = F.dropout(x, p=self.dropout, training=self.training)
+        return self.fc3(x)
+
+def _state_dict_cpu(model):
+    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+def train_model(model, train_loader, val_loader, loss_fn, class_names,
+                epochs=10, lr=1e-3, weight_decay=WEIGHT_DECAY, desc="Model"):
+    model.to(device)
+    opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    best = None
+    best_val = None
+
+    for ep in range(1, epochs+1):
+        model.train()
+        total_loss = 0.0
+        for xb, yb in train_loader:
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
+            opt.zero_grad(set_to_none=True)
+            out = model(xb)
+            loss = loss_fn(out, yb)
+            loss.backward()
+            opt.step()
+            total_loss += float(loss.item())
+
+        val_metrics = evaluate(model, val_loader, class_names=class_names, detail=False)
+        score = val_metrics["micro_f1"]
+        print(f"[{desc}] ep {ep}/{epochs} loss {total_loss/max(1,len(train_loader)):.4f} | val {val_metrics}")
+
+        if best_val is None or score > best_val:
+            best_val = score
+            best = _state_dict_cpu(model)
+
+    if best is not None:
+        model.load_state_dict(best)
+    return model
+
+# -------------------------
+# 6) DynamicGate (3-phase target + sparsity-aware checkpoint)
+# -------------------------
+# class LowRankGate(nn.Module):
+#     def __init__(self, in_dim, out_dim, rank=32, p0=0.9):
+#         super().__init__()
+#         self.A = nn.Linear(in_dim, rank, bias=False)
+#         self.B = nn.Linear(rank, out_dim, bias=True)
+#         z0 = float(torch.logit(torch.tensor(p0)))
+#         nn.init.zeros_(self.A.weight)
+#         nn.init.zeros_(self.B.weight)
+#         nn.init.constant_(self.B.bias, z0)
+
+#     def forward(self, x):
+#         return self.B(self.A(x))
+
+# class LowRankGate(nn.Module):
+#     def __init__(self, in_dim, out_dim, rank=64, p0=0.9, init_scale=0.02):
+#         super().__init__()
+#         self.A = nn.Linear(in_dim, rank, bias=False)
+#         self.B = nn.Linear(rank, out_dim, bias=True)
+
+#         # ✅ 대칭 깨기: 작은 랜덤으로 시작 (입력 의존 게이팅 가능해짐)
+#         nn.init.normal_(self.A.weight, mean=0.0, std=init_scale)
+#         nn.init.normal_(self.B.weight, mean=0.0, std=init_scale)
+
+#         # bias는 원하는 초기 open 확률(p0)로
+#         p0 = float(np.clip(p0, 1e-4, 1-1e-4))
+#         z0 = float(torch.logit(torch.tensor(p0)))
+#         nn.init.constant_(self.B.bias, z0)
+
+#     def forward(self, x):
+#         return self.B(self.A(x))
+
+class LowRankGate(nn.Module):
+    def __init__(self, in_dim, out_dim, rank=64, p0=0.95, init_scale=0.02):
+        super().__init__()
+        self.A = nn.Linear(in_dim, rank, bias=False)
+        self.B = nn.Linear(rank, out_dim, bias=True)
+
+        nn.init.normal_(self.A.weight, mean=0.0, std=init_scale)
+        nn.init.normal_(self.B.weight, mean=0.0, std=init_scale)
+
+        p0 = float(np.clip(p0, 1e-4, 1-1e-4))
+        z0 = float(torch.logit(torch.tensor(p0)))
+        nn.init.constant_(self.B.bias, z0)
+
+    def forward(self, x):
+        return self.B(self.A(x))
+
+
+class DynamicGatedMLP(nn.Module):
+    def __init__(self, in_dim, h1, h2, out_dim, tau=2.5, thr=0.15, p0=0.9, rank1=32, rank2=32):
+        super().__init__()
+        self.ln0 = nn.LayerNorm(in_dim)
+        self.fc1 = nn.Linear(in_dim, h1)
+        self.fc2 = nn.Linear(h1, h2)
+        self.fc3 = nn.Linear(h2, out_dim)
+        self.gate1 = LowRankGate(in_dim, h1, rank=rank1, p0=p0)
+        self.gate2 = LowRankGate(h1,   h2, rank=rank2, p0=p0)
+        self.tau = float(tau)
+        self.thr = float(thr)
+
+    def _hard_gate_ste(self, logits):
+        p = torch.sigmoid(logits / self.tau)
+        g = (p > self.thr).float()
+        g_st = g + (p - p.detach())
+        return p, g_st
+
+    def forward(self, x, return_stats=False):
+        x = self.ln0(x)
+
+        logits1 = self.gate1(x)
+        p1, g1 = self._hard_gate_ste(logits1)
+
+        h1 = F.gelu(self.fc1(x))
+        h1 = h1 * g1
+
+        logits2 = self.gate2(h1)
+        p2, g2 = self._hard_gate_ste(logits2)
+
+        h2 = F.gelu(self.fc2(h1))
+        h2 = h2 * g2
+
+        out = self.fc3(h2)
+        if return_stats:
+            return out, p1, g1, p2, g2
+        return out
+
+@torch.no_grad()
+def quick_gate_stats(model, loader, max_batches=GATE_STATS_MAX_BATCHES):
+    model.eval()
+    p1s, p2s, g1s, g2s = [], [], [], []
+    for i, (xb, yb) in enumerate(loader):
+        if i >= max_batches: break
+        xb = xb.to(device, non_blocking=True)
+        out, p1, g1, p2, g2 = model(xb, return_stats=True)
+        p1s.append(float(p1.mean().item()))
+        p2s.append(float(p2.mean().item()))
+        g1s.append(float(g1.mean().item()))
+        g2s.append(float(g2.mean().item()))
+    return (float(np.mean(p1s)), float(np.mean(p2s)),
+            float(np.mean(g1s)), float(np.mean(g2s)))
+
+# -------------------------
+# (ADD) RigL-only MLP (no gates)
+# -------------------------
+class RigLMLP(nn.Module):
+    def __init__(self, in_dim, h1, h2, out_dim,
+                 density1=0.25, density2=0.25,
+                 rigl_delta=0.05, rigl_interval=400,
+                 init_scale=0.02):
+        super().__init__()
+        self.ln0 = nn.LayerNorm(in_dim)
+        self.fc1 = MaskedLinearRigL(in_dim, h1, density=density1, init_scale=init_scale, bias=True)
+        self.fc2 = MaskedLinearRigL(h1,   h2, density=density2, init_scale=init_scale, bias=True)
+        self.fc3 = nn.Linear(h2, out_dim)
+
+        self.rigl_delta = float(rigl_delta)
+        self.rigl_interval = int(rigl_interval)
+        self._step = 0
+
+    def forward(self, x):
+        x = self.ln0(x)
+        h1 = F.gelu(self.fc1(x))
+        h2 = F.gelu(self.fc2(h1))
+        return self.fc3(h2)
+
+    @torch.no_grad()
+    def rigl_step(self):
+        self._step += 1
+        if self._step % self.rigl_interval != 0:
+            return
+        self.fc1.rewire(delta=self.rigl_delta)
+        self.fc2.rewire(delta=self.rigl_delta)
+
+    @torch.no_grad()
+    def weight_densities(self):
+        return self.fc1.density_ratio(), self.fc2.density_ratio()
+
+
+def train_rigl_only(model, train_loader, val_loader, loss_fn, class_names,
+                    epochs=10, lr=1e-3, weight_decay=WEIGHT_DECAY, desc="RigL-only"):
+    model.to(device)
+    opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    best = None
+    best_val = None
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        total_loss = 0.0
+
+        for xb, yb in train_loader:
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
+
+            opt.zero_grad(set_to_none=True)
+            out = model(xb)
+            loss = loss_fn(out, yb)
+            loss.backward()
+            opt.step()
+
+            # ✅ RigL rewiring step
+            model.rigl_step()
+
+            total_loss += float(loss.item())
+
+        val_metrics = evaluate(model, val_loader, class_names=class_names, detail=False)
+        score = val_metrics["micro_f1"]
+        d1, d2 = model.weight_densities()
+
+        print(f"[{desc}] ep {ep}/{epochs} loss {total_loss/max(1,len(train_loader)):.4f} "
+              f"| dens(fc1)={d1:.3f} dens(fc2)={d2:.3f} | val {val_metrics}")
+
+        if best_val is None or score > best_val:
+            best_val = score
+            best = _state_dict_cpu(model)
+
+    if best is not None:
+        model.load_state_dict(best)
+    return model
+
+
+# def train_dynamic_gate(
+#     model, train_loader, val_loader, loss_fn, class_names,
+#     epochs=10, lr=2e-3, weight_decay=1e-4,
+#     # temperature / threshold schedules
+#     tau_hi=2.5, tau_lo=0.5,
+#     thr_warm=0.15, thr_final=0.75,
+#     # 3-phase target (초기 거의 열기 -> 중기 절반 -> 말기 많이 닫기)
+#     phase1_frac=0.30, phase2_frac=0.70,
+#     target1_stage1=0.95, target2_stage1=0.80,
+#     target1_stage2=0.55, target2_stage2=0.35,
+#     target1_stage3=0.25, target2_stage3=0.15,
+#     # regularization
+#     lambda_g=5e-3,
+#     warmup_epochs=1,
+#     # sparsity-aware checkpoint
+#     f1_eps=0.20,  # val micro_f1이 이 범위 안이면 더 sparse한 모델 선호
+#     desc="DynamicGate",
+# ):
+#     model.to(device)
+
+#     # gate에 좀 더 잘 반응하게 하고 싶으면 param-group으로 gate lr을 약간 키워도 됨(선택)
+#     opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+#     best_sd = None
+#     best_f1 = -1e9
+#     best_sparse = 1e9  # 낮을수록 sparse(= p가 작음)
+
+#     def _lerp(a, b, t):
+#         return a + (b - a) * t
+
+#     def _targets(ep):
+#         t = (ep - 1) / max(1, epochs - 1)
+#         if t < phase1_frac:
+#             return target1_stage1, target2_stage1
+#         elif t < phase2_frac:
+#             return target1_stage2, target2_stage2
+#         else:
+#             return target1_stage3, target2_stage3
+#     def _targets_by_epoch(ep, epochs):
+#         e1 = int(round(0.3 * epochs))  # 30%
+#         e2 = int(round(0.7 * epochs))  # 70%
+#         if ep <= e1:
+#             return 0.95, 0.95
+#         elif ep <= e2:
+#             return 0.50, 0.35
+#         else:
+#             return 0.25, 0.15
+
+#     for ep in range(1, epochs + 1):
+#         t = (ep - 1) / max(1, epochs - 1)
+#         model.tau = _lerp(tau_hi, tau_lo, t)
+#         model.thr = _lerp(thr_warm, thr_final, t)
+
+#         tgt1, tgt2 = _targets(ep)
+
+#         # warmup 동안 reg를 거의 끄고 task 안정화
+#         if ep <= warmup_epochs:
+#             lam = 0.0
+#         else:
+#             tt = (ep - 1 - warmup_epochs) / max(1, (epochs - 1 - warmup_epochs))
+#             lam = lambda_g * (tt ** 2)
+
+#         model.train()
+#         total_loss = 0.0
+#         p1_list, p2_list, g1_list, g2_list = [], [], [], []
+
+#         for xb, yb in train_loader:
+#             xb = xb.to(device, non_blocking=True)
+#             yb = yb.to(device, non_blocking=True)
+
+#             opt.zero_grad(set_to_none=True)
+#             out, p1, g1, p2, g2 = model(xb, return_stats=True)
+
+#             loss_task = loss_fn(out, yb)
+#             # ✅ target_p로 끌어가는 MSE(초기엔 열고, 후반엔 닫히게 됨)
+#             # reg = lam * ((p1.mean() - tgt1) ** 2 + (p2.mean() - tgt2) ** 2)
+
+#             t_p1, t_p2 = _targets_by_epoch(ep, epochs)
+#             reg = lambda_now * ((p1.mean() - t_p1)**2 + (p2.mean() - t_p2)**2)
+
+
+
+#             loss = loss_task + reg
+
+#             loss.backward()
+#             opt.step()
+
+#             total_loss += float(loss.item())
+#             p1_list.append(float(p1.mean().detach().cpu()))
+#             p2_list.append(float(p2.mean().detach().cpu()))
+#             g1_list.append(float(g1.mean().detach().cpu()))
+#             g2_list.append(float(g2.mean().detach().cpu()))
+
+#         val_metrics = evaluate(model, val_loader, class_names=class_names, detail=False)
+#         val_f1 = float(val_metrics["micro_f1"])
+
+#         # ✅ val에서 gate 통계도 같이 봄(체크포인트 선택에 사용)
+#         vp1, vp2, vg1, vg2 = quick_gate_stats(model, val_loader, max_batches=10)
+#         sparse_score = (vp1 + vp2) / 2.0  # 낮을수록 더 닫힘(soft)
+
+#         print(
+#             f"[{desc}] ep {ep}/{epochs} "
+#             f"loss {total_loss/max(1,len(train_loader)):.4f} | "
+#             f"tau {model.tau:.2f} thr {model.thr:.2f} lam {lam:.2e} | "
+#             f"target(p) ({tgt1:.2f},{tgt2:.2f}) | "
+#             f"train p({np.mean(p1_list):.3f},{np.mean(p2_list):.3f}) g({np.mean(g1_list):.3f},{np.mean(g2_list):.3f}) | "
+#             f"val p({vp1:.3f},{vp2:.3f}) g({vg1:.3f},{vg2:.3f}) | val {val_metrics}"
+#         )
+
+#         # ✅ sparsity-aware checkpoint:
+#         #  - f1이 더 좋아지면 갱신
+#         #  - f1이 비슷하면(±f1_eps) 더 sparse한 모델로 갱신
+#         if (val_f1 > best_f1 + 1e-12) or (val_f1 >= best_f1 - f1_eps and sparse_score < best_sparse):
+#             best_f1 = max(best_f1, val_f1)
+#             best_sparse = min(best_sparse, sparse_score) if val_f1 >= best_f1 - f1_eps else sparse_score
+#             best_sd = _state_dict_cpu(model)
+
+#     if best_sd is not None:
+#         model.load_state_dict(best_sd)
+#     return model
+
+def train_dynamic_gate(
+    model, train_loader, val_loader, loss_fn, class_names,
+    epochs=10, lr=1e-3, weight_decay=WEIGHT_DECAY,
+    tau_hi=4.0, tau_lo=1.2,
+    thr_warm=0.25, thr_final=0.80,
+    phase1_frac=0.30, phase2_frac=0.70,          # 1구간=30%, 2구간=~70%, 3구간=나머지
+    target1_stage1=0.95, target2_stage1=0.95,    # 1구간: 거의 다 열기
+    target1_stage2=0.50, target2_stage2=0.35,    # 2구간: 절반 정도
+    target1_stage3=0.25, target2_stage3=0.15,    # 3구간: 거의 닫기
+    lambda_g=2e-2, warmup_epochs=2,              # ✅ warmup 동안 reg=0, 이후 점진 증가
+    desc="DynamicGate"
+):
+    model.to(device)
+    opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    best = None
+    best_val = None
+
+    def _lerp(a, b, t):
+        return a + (b - a) * t
+
+    def _targets_by_epoch(ep, epochs):
+        e1 = max(1, int(round(phase1_frac * epochs)))
+        e2 = max(e1 + 1, int(round(phase2_frac * epochs)))
+        if ep <= e1:
+            return target1_stage1, target2_stage1
+        elif ep <= e2:
+            return target1_stage2, target2_stage2
+        else:
+            return target1_stage3, target2_stage3
+
+    for ep in range(1, epochs + 1):
+        # -------- schedules (tau/thr) --------
+        t = (ep - 1) / max(1, epochs - 1)
+        model.tau = _lerp(tau_hi, tau_lo, t)
+        model.thr = _lerp(thr_warm, thr_final, t)
+
+        # -------- ✅ lambda_now 정의(여기가 핵심) --------
+        if ep <= warmup_epochs:
+            lambda_now = 0.0
+        else:
+            tt = (ep - 1 - warmup_epochs) / max(1, (epochs - 1 - warmup_epochs))
+            lambda_now = lambda_g * (tt ** 2)   # 후반으로 갈수록 강해짐
+
+        t_p1, t_p2 = _targets_by_epoch(ep, epochs)
+
+        model.train()
+        total_loss = 0.0
+        p1_list, p2_list, g1_list, g2_list = [], [], [], []
+
+        for xb, yb in train_loader:
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
+
+            opt.zero_grad(set_to_none=True)
+            out, p1, g1, p2, g2 = model(xb, return_stats=True)
+
+            loss_task = loss_fn(out, yb)
+      ## 표준편차 많음.       reg = lambda_now * ((p1.mean() - t_p1)**2 + (p2.mean() - t_p2)**2)
+            reg = lambda_now * ((g1.mean() - t_p1)**2 + (g2.mean() - t_p2)**2) # 표준편차 줄이기 시도
+
+            loss = loss_task + reg
+
+            loss.backward()
+            opt.step()
+
+            total_loss += float(loss.item())
+            p1_list.append(float(p1.mean().detach().cpu()))
+            p2_list.append(float(p2.mean().detach().cpu()))
+            g1_list.append(float(g1.mean().detach().cpu()))
+            g2_list.append(float(g2.mean().detach().cpu()))
+
+        val_metrics = evaluate(model, val_loader, class_names=class_names, detail=False)
+        score = val_metrics["micro_f1"]
+
+        print(
+            f"[{desc}] ep {ep}/{epochs} "
+            f"loss {total_loss/max(1,len(train_loader)):.4f} | "
+            f"tau {model.tau:.2f} thr {model.thr:.2f} lam {lambda_now:.2e} | "
+            f"target(g) ({t_p1:.2f},{t_p2:.2f}) | "      # old set : f"target(p) ({t_p1:.2f},{t_p2:.2f}) | "
+            f"train p({np.mean(p1_list):.3f},{np.mean(p2_list):.3f}) g({np.mean(g1_list):.3f},{np.mean(g2_list):.3f}) | "
+            f"val {val_metrics}"
+        )
+
+        if best_val is None or score > best_val:
+            best_val = score
+            best = _state_dict_cpu(model)
+
+    if best is not None:
+        model.load_state_dict(best)
+    return model
+
+
+@torch.no_grad()
+def estimate_open_rates_dynamic_any(model, loader, max_batches=50):
+    model.eval()
+    g1s, g2s = [], []
+    for i, (xb, yb) in enumerate(loader):
+        if i >= max_batches: break
+        xb = xb.to(device, non_blocking=True)
+        out, p1, g1, p2, g2 = model(xb, return_stats=True)
+        g1s.append(float(g1.mean().item()))
+        g2s.append(float(g2.mean().item()))
+    return float(np.mean(g1s)), float(np.mean(g2s))
+
+# -------------------------
+# 7) RigL (masked linear + rewire)
+# -------------------------
+class MaskedLinearRigLFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, W, b, M, handle_tensor):
+        handle = int(handle_tensor.item())
+        Wm = W * M
+        ctx.save_for_backward(x, W, b, M)
+        ctx.handle = handle
+        return F.linear(x, Wm, b)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, W, b, M = ctx.saved_tensors
+        Wm = W * M
+
+        grad_x = grad_out @ Wm
+        grad_W_dense = grad_out.transpose(0, 1) @ x
+
+        _DENSE_GRAD_STORE[ctx.handle] = grad_W_dense.detach().to("cpu", dtype=torch.float16)
+
+        grad_W = grad_W_dense * M
+        grad_b = grad_out.sum(dim=0) if b is not None else None
+        return grad_x, grad_W, grad_b, None, None
+
+class MaskedLinearRigL(nn.Module):
+    def __init__(self, in_dim, out_dim, density=0.25, init_scale=0.02, bias=True):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.density = float(density)
+        self.init_scale = float(init_scale)
+
+        self.weight = nn.Parameter(torch.empty(out_dim, in_dim))
+        self.bias = nn.Parameter(torch.zeros(out_dim)) if bias else None
+
+        self.handle = next(_HANDLE_COUNTER)
+        self.register_buffer("mask", self._init_mask(out_dim, in_dim, self.density))
+        nn.init.normal_(self.weight, mean=0.0, std=self.init_scale)
+
+    def _init_mask(self, out_dim, in_dim, density):
+        numel = out_dim * in_dim
+        k = max(1, int(numel * density))
+        flat = torch.zeros(numel, dtype=torch.float32)
+        idx = torch.randperm(numel)[:k]
+        flat[idx] = 1.0
+        return flat.view(out_dim, in_dim)
+
+    def forward(self, x):
+        h = torch.tensor(self.handle, device=x.device, dtype=torch.int64)
+        return MaskedLinearRigLFn.apply(x, self.weight, self.bias, self.mask, h)
+
+    @torch.no_grad()
+    def rewire(self, delta=0.05):
+        delta = float(delta)
+        W = self.weight.data
+        M = self.mask.data
+        flatW = W.view(-1)
+        flatM = M.view(-1)
+
+        active_idx = torch.nonzero(flatM > 0.5, as_tuple=False).view(-1)
+        inactive_idx = torch.nonzero(flatM < 0.5, as_tuple=False).view(-1)
+        n_active = active_idx.numel()
+        if n_active == 0: return
+
+        k = int(n_active * delta)
+        if k < 1: return
+
+        active_scores = flatW[active_idx].abs()
+        prune_in_active = torch.topk(active_scores, k, largest=False).indices
+        prune_idx = active_idx[prune_in_active]
+
+        flatM[prune_idx] = 0.0
+        flatW[prune_idx] = 0.0
+
+        grad_dense = _DENSE_GRAD_STORE.get(self.handle, None)
+        if grad_dense is None:
+            kk = min(k, inactive_idx.numel())
+            grow_pick = inactive_idx[torch.randperm(inactive_idx.numel())[:kk]]
+        else:
+            flatG = grad_dense.abs().to(device=W.device, dtype=torch.float32).view(-1)
+            grow_scores = flatG[inactive_idx]
+            kk = min(k, grow_scores.numel())
+            grow_in_inactive = torch.topk(grow_scores, kk, largest=True).indices
+            grow_pick = inactive_idx[grow_in_inactive]
+
+        flatM[grow_pick] = 1.0
+        flatW[grow_pick] = torch.randn_like(flatW[grow_pick]) * self.init_scale
+
+    @torch.no_grad()
+    def density_ratio(self):
+        return float(self.mask.mean().item())
+
+class DynamicGateRigLMLP(nn.Module):
+    def __init__(self, in_dim, h1, h2, out_dim,
+                 tau=2.5, thr=0.15, p0=0.9,
+                 rank1=32, rank2=32,
+                 density1=0.25, density2=0.25,
+                 rigl_delta=0.05, rigl_interval=400,
+                 init_scale=0.02):
+        super().__init__()
+        self.ln0 = nn.LayerNorm(in_dim)
+        self.fc1 = MaskedLinearRigL(in_dim, h1, density=density1, init_scale=init_scale, bias=True)
+        self.fc2 = MaskedLinearRigL(h1,   h2, density=density2, init_scale=init_scale, bias=True)
+        self.fc3 = nn.Linear(h2, out_dim)
+
+        self.gate1 = LowRankGate(in_dim, h1, rank=rank1, p0=p0)
+        self.gate2 = LowRankGate(h1,   h2, rank=rank2, p0=p0)
+
+        self.tau = float(tau)
+        self.thr = float(thr)
+
+        self.rigl_delta = float(rigl_delta)
+        self.rigl_interval = int(rigl_interval)
+        self._step = 0
+
+    def _hard_gate_ste(self, logits):
+        p = torch.sigmoid(logits / self.tau)
+        g = (p > self.thr).float()
+        g_st = g + (p - p.detach())
+        return p, g_st
+
+    def forward(self, x, return_stats=False):
+        x = self.ln0(x)
+
+        logits1 = self.gate1(x)
+        p1, g1 = self._hard_gate_ste(logits1)
+
+        h1 = F.gelu(self.fc1(x))
+        h1 = h1 * g1
+
+        logits2 = self.gate2(h1)
+        p2, g2 = self._hard_gate_ste(logits2)
+
+        h2 = F.gelu(self.fc2(h1))
+        h2 = h2 * g2
+
+        out = self.fc3(h2)
+        if return_stats:
+            return out, p1, g1, p2, g2
+        return out
+
+    @torch.no_grad()
+    def rigl_step(self):
+        self._step += 1
+        if self._step % self.rigl_interval != 0:
+            return
+        self.fc1.rewire(delta=self.rigl_delta)
+        self.fc2.rewire(delta=self.rigl_delta)
+
+    @torch.no_grad()
+    def weight_densities(self):
+        return self.fc1.density_ratio(), self.fc2.density_ratio()
+
+def train_dynamicgate_rigl(
+    model, train_loader, val_loader, loss_fn, class_names,
+    epochs=10, lr=2e-3, weight_decay=WEIGHT_DECAY,
+    tau_hi=2.5, tau_lo=0.5,
+    thr_warm=0.15, thr_final=0.75,
+    phase1_frac=0.30, phase2_frac=0.70,
+    target1_stage1=0.95, target2_stage1=0.80,
+    target1_stage2=0.55, target2_stage2=0.35,
+    target1_stage3=0.25, target2_stage3=0.15,
+    lambda_g=5e-3,
+    warmup_epochs=1,
+    f1_eps=0.20,
+    desc="DynamicGate+RigL"
+):
+    model.to(device)
+    opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    best_sd = None
+    best_f1 = -1e9
+    best_sparse = 1e9
+
+    def _lerp(a, b, t):
+        return a + (b - a) * t
+
+    def _targets(ep):
+        t = (ep - 1) / max(1, epochs - 1)
+        if t < phase1_frac:
+            return target1_stage1, target2_stage1
+        elif t < phase2_frac:
+            return target1_stage2, target2_stage2
+        else:
+            return target1_stage3, target2_stage3
+
+    for ep in range(1, epochs + 1):
+        t = (ep - 1) / max(1, epochs - 1)
+        model.tau = _lerp(tau_hi, tau_lo, t)
+        model.thr = _lerp(thr_warm, thr_final, t)
+        tgt1, tgt2 = _targets(ep)
+
+        if ep <= warmup_epochs:
+            lam = 0.0
+        else:
+            tt = (ep - 1 - warmup_epochs) / max(1, (epochs - 1 - warmup_epochs))
+            lam = lambda_g * (tt ** 2)
+
+        model.train()
+        total_loss = 0.0
+        p1_list, p2_list, g1_list, g2_list = [], [], [], []
+
+        for xb, yb in train_loader:
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
+
+            opt.zero_grad(set_to_none=True)
+            out, p1, g1, p2, g2 = model(xb, return_stats=True)
+
+            loss_task = loss_fn(out, yb)
+         ##   reg = lam * ((p1.mean() - tgt1) ** 2 + (p2.mean() - tgt2) ** 2)
+            reg = lam * ((g1.mean() - tgt1) ** 2 + (g2.mean() - tgt2) ** 2)
+
+            loss = loss_task + reg
+
+            loss.backward()
+            opt.step()
+
+            model.rigl_step()
+
+            total_loss += float(loss.item())
+            p1_list.append(float(p1.mean().detach().cpu()))
+            p2_list.append(float(p2.mean().detach().cpu()))
+            g1_list.append(float(g1.mean().detach().cpu()))
+            g2_list.append(float(g2.mean().detach().cpu()))
+
+        val_metrics = evaluate(model, val_loader, class_names=class_names, detail=False)
+        val_f1 = float(val_metrics["micro_f1"])
+
+        vp1, vp2, vg1, vg2 = quick_gate_stats(model, val_loader, max_batches=GATE_STATS_MAX_BATCHES)
+        sparse_score = (vp1 + vp2) / 2.0
+
+        d1, d2 = model.weight_densities()
+
+        print(
+            f"[{desc}] ep {ep}/{epochs} "
+            f"loss {total_loss/max(1,len(train_loader)):.4f} | "
+            f"tau {model.tau:.2f} thr {model.thr:.2f} lam {lam:.2e} | "
+            f"target(g) ({tgt1:.2f},{tgt2:.2f}) | "   # p=>g
+            f"train p({np.mean(p1_list):.3f},{np.mean(p2_list):.3f}) g({np.mean(g1_list):.3f},{np.mean(g2_list):.3f}) | "
+            f"val p({vp1:.3f},{vp2:.3f}) g({vg1:.3f},{vg2:.3f}) | dens({d1:.2f},{d2:.2f}) | val {val_metrics}"
+        )
+
+        if (val_f1 > best_f1 + 1e-12) or (val_f1 >= best_f1 - f1_eps and sparse_score < best_sparse):
+            best_f1 = max(best_f1, val_f1)
+            best_sparse = min(best_sparse, sparse_score) if val_f1 >= best_f1 - f1_eps else sparse_score
+            best_sd = _state_dict_cpu(model)
+
+    if best_sd is not None:
+        model.load_state_dict(best_sd)
+    return model
+
+# -------------------------
+# 8) MACs helpers
+# -------------------------
+def mlp_macs(in_dim, h1, h2, out_dim):
+    return in_dim*h1 + h1*h2 + h2*out_dim
+
+def count_nonzero_linear_weights(model):
+    nz = 0
+    total = 0
+    for m in model.modules():
+        if isinstance(m, nn.Linear):
+            w = m.weight.detach()
+            total += w.numel()
+            nz += (w != 0).sum().item()
+    return nz, total
+
+def pareto_front(df_xy, x_col="macs_mean", y_col="acc_mean"):
+    """
+    x 최소화, y 최대화 기준 Pareto front 반환.
+    x 오름차순으로 정렬 후 y의 누적최대 갱신점만 남김.
+    """
+    d = df_xy.sort_values(x_col).reset_index(drop=True)
+    keep = []
+    best_y = -1e18
+    for i in range(len(d)):
+        y = d.loc[i, y_col]
+        if y > best_y + 1e-12:
+            keep.append(i)
+            best_y = y
+    return d.loc[keep].reset_index(drop=True)
+
+
+# -------------------------
+# 10) Load data ONCE (PBMC3k)
+# -------------------------
+adata, X_csr, y, class_names = load_pbmc3k_leiden(
+    n_hvg=N_HVG, resolution=LEIDEN_RES, min_cluster_size=MIN_CLUSTER, seed=0
+)
+y_classes = class_names
+num_classes = len(y_classes)
+in_dim = X_csr.shape[1]
+
+H1, H2 = choose_widths(in_dim)
+OUT = num_classes
+BATCH_SIZE = auto_batch_size(in_dim, BASE_BATCH)
+
+print(f"[Loader] adata shape={adata.shape}")
+print("Chosen TARGET_COL = label (Leiden)")
+print("[Classification] num_classes =", num_classes, "| classes:", y_classes)
+print("MLP widths:", H1, H2, "OUT:", OUT, "| in_dim:", in_dim, "| batch:", BATCH_SIZE)
+ram("after data ready")
+
+base_macs = float(mlp_macs(in_dim, H1, H2, OUT))
+
+# -------------------------
+# 11) Run multi-seed experiments
+# -------------------------
+rows = []
+
+for si, seed in enumerate(SEEDS, 1):
+    print(f"\n==================== SEED {seed} ({si}/{len(SEEDS)}) ====================")
+    set_seed(seed)
+
+    train_idx, val_idx, test_idx = stratified_split_all_classes(
+        y, test_size=TEST_SIZE, val_size=VAL_SIZE, seed=seed
+    )
+
+    print("split sizes:", len(train_idx), len(val_idx), len(test_idx))
+    print("class counts (train):", np.bincount(y[train_idx], minlength=num_classes).tolist())
+
+    collate_fn = make_collate_fn(X_csr)
+    train_loader = DataLoader(IndexDataset(train_idx, y), batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=0, pin_memory=(device.type=="cuda"),
+                              drop_last=False, collate_fn=collate_fn)
+    val_loader   = DataLoader(IndexDataset(val_idx, y), batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=0, pin_memory=(device.type=="cuda"),
+                              drop_last=False, collate_fn=collate_fn)
+    test_loader  = DataLoader(IndexDataset(test_idx, y), batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=0, pin_memory=(device.type=="cuda"),
+                              drop_last=False, collate_fn=collate_fn)
+
+    # class weights from TRAIN
+    w_np = compute_class_weights_from_train(y[train_idx], num_classes, mode="balanced", clip_max=CLASS_WEIGHT_CLIP_MAX)
+    w_t  = torch.tensor(w_np, device=device, dtype=torch.float32)
+    loss_fn = make_loss_fn(w_t)
+    print("class_weights:", {y_classes[i]: float(w_np[i]) for i in range(num_classes)})
+
+    # ---- Baseline ----
+    t0 = time.time()
+    baseline = MLP(in_dim, H1, H2, OUT, dropout=0.0)
+    baseline = train_model(baseline, train_loader, val_loader, loss_fn, y_classes,
+                           epochs=EPOCHS, lr=LR, weight_decay=WEIGHT_DECAY, desc="Baseline")
+    m_base = evaluate(baseline, test_loader, class_names=y_classes, detail=False)
+    sec = time.time() - t0
+    rows.append({
+        "seed": seed, "model": "Baseline", "seconds": sec,
+        **m_base,
+        "macs": base_macs, "macs_reduct_pct": 0.0,
+        "open1": np.nan, "open2": np.nan, "dens1": np.nan, "dens2": np.nan, "nz_ratio": np.nan
+    })
+    cleanup()
+
+    # ---- Dropout ----
+    t0 = time.time()
+    dropout_model = MLP(in_dim, H1, H2, OUT, dropout=DROPOUT_P)
+    dropout_model = train_model(dropout_model, train_loader, val_loader, loss_fn, y_classes,
+                                epochs=EPOCHS, lr=LR, weight_decay=WEIGHT_DECAY, desc="Dropout")
+    m_do = evaluate(dropout_model, test_loader, class_names=y_classes, detail=False)
+    sec = time.time() - t0
+    rows.append({
+        "seed": seed, "model": "Dropout", "seconds": sec,
+        **m_do,
+        "macs": base_macs, "macs_reduct_pct": 0.0,
+        "open1": np.nan, "open2": np.nan, "dens1": np.nan, "dens2": np.nan, "nz_ratio": np.nan
+    })
+    cleanup()
+
+    # ---- Pruned (global unstructured) ----
+    t0 = time.time()
+    pruned_model = MLP(in_dim, H1, H2, OUT, dropout=0.0)
+    pruned_model.load_state_dict(_state_dict_cpu(baseline))
+    pruned_model.to(device)
+
+    linear_params = [(m, "weight") for m in pruned_model.modules() if isinstance(m, nn.Linear)]
+
+    prune.global_unstructured(
+        parameters=linear_params,
+        pruning_method=prune.L1Unstructured,
+        amount=PRUNE_AMOUNT
+    )
+
+    # ✅ FT 동안 mask 유지
+    pruned_model = train_model(
+        pruned_model, train_loader, val_loader, loss_fn,
+        class_names=y_classes,
+        epochs=PRUNE_FT_EPOCHS, lr=LR*PRUNE_FT_LR_MULT, weight_decay=WEIGHT_DECAY, desc="Pruned-FT"
+    )
+    m_pr = evaluate(pruned_model, test_loader, class_names=y_classes, detail=False)
+
+    # ✅ FT 끝난 뒤 remove 후 nz_ratio 측정
+    for m in pruned_model.modules():
+        if isinstance(m, nn.Linear):
+            prune.remove(m, "weight")
+
+    nz, tot = count_nonzero_linear_weights(pruned_model)
+    nz_ratio = nz / max(1, tot)
+    pruned_macs = base_macs * nz_ratio
+    sec = time.time() - t0
+
+    rows.append({
+        "seed": seed, "model": "Pruned", "seconds": sec,
+        **m_pr,
+        "macs": float(pruned_macs),
+        "macs_reduct_pct": float((1.0 - pruned_macs/base_macs) * 100.0),
+        "open1": np.nan, "open2": np.nan, "dens1": np.nan, "dens2": np.nan,
+        "nz_ratio": float(nz_ratio)
+    })
+    cleanup()
+
+    # ---- DynamicGate ----
+    t0 = time.time()
+    dyn_gate = DynamicGatedMLP(
+        in_dim, H1, H2, OUT,
+        tau=TAU_HI, thr=GATE_THR_WARM, p0=GATE_P0,
+        rank1=GATE_RANK1, rank2=GATE_RANK2
+    )
+    dyn_gate = train_dynamic_gate(
+        dyn_gate, train_loader, val_loader, loss_fn, y_classes,
+        epochs=EPOCHS, lr=LR, weight_decay=WEIGHT_DECAY,
+        tau_hi=TAU_HI, tau_lo=TAU_LO,
+        thr_warm=GATE_THR_WARM, thr_final=GATE_THR_FINAL,
+        phase1_frac=PHASE1_FRAC, phase2_frac=PHASE2_FRAC,
+        target1_stage1=T1_S1, target2_stage1=T2_S1,
+        target1_stage2=T1_S2, target2_stage2=T2_S2,
+        target1_stage3=T1_S3, target2_stage3=T2_S3,
+        lambda_g=LAMBDA_G,
+        warmup_epochs=GATE_WARMUP_EPOCHS,
+       # f1_eps=F1_EPS,
+        desc="DynamicGate"
+    )
+    m_dg = evaluate(dyn_gate, test_loader, class_names=y_classes, detail=False)
+
+    open1_dg, open2_dg = estimate_open_rates_dynamic_any(dyn_gate, test_loader, max_batches=OPENRATE_MAX_BATCHES)
+    dg_macs = (
+        in_dim*(H1*open1_dg) +
+        (H1*open1_dg)*(H2*open2_dg) +
+        (H2*open2_dg)*OUT
+    )
+    sec = time.time() - t0
+
+    rows.append({
+        "seed": seed, "model": "DynamicGate", "seconds": sec,
+        **m_dg,
+        "macs": float(dg_macs),
+        "macs_reduct_pct": float((1.0 - dg_macs/base_macs) * 100.0),
+        "open1": float(open1_dg), "open2": float(open2_dg),
+        "dens1": np.nan, "dens2": np.nan, "nz_ratio": np.nan
+    })
+    cleanup()
+
+    # ---- RigL-only (NO gates) ----
+    t0 = time.time()
+    rigl_only = RigLMLP(
+        in_dim, H1, H2, OUT,
+        density1=RIGL_DENSITY1, density2=RIGL_DENSITY2,
+        rigl_delta=RIGL_DELTA, rigl_interval=RIGL_INTERVAL,
+        init_scale=INIT_SCALE
+    )
+    rigl_only = train_rigl_only(
+        rigl_only, train_loader, val_loader, loss_fn, y_classes,
+        epochs=EPOCHS, lr=LR, weight_decay=WEIGHT_DECAY, desc="RigL-only"
+    )
+    m_ro = evaluate(rigl_only, test_loader, class_names=y_classes, detail=False)
+
+    d1, d2 = rigl_only.weight_densities()
+
+    # ✅ MACs (activation sparsity 없음, weight sparsity만 반영)
+    # fc1, fc2는 density로 줄고, fc3는 dense로 둠
+    rigl_macs = (in_dim * H1 * d1) + (H1 * H2 * d2) + (H2 * OUT)
+
+    sec = time.time() - t0
+    rows.append({
+        "seed": seed, "model": "RigL-only", "seconds": sec,
+        **m_ro,
+        "macs": float(rigl_macs),
+        "macs_reduct_pct": float((1.0 - rigl_macs/base_macs) * 100.0),
+        "open1": 1.0, "open2": 1.0,          # 게이트 없음 → 개념상 항상 open
+        "dens1": float(d1), "dens2": float(d2),
+        "nz_ratio": np.nan
+    })
+    cleanup()
+
+
+    # ---- DynamicGate + RigL ----
+    t0 = time.time()
+    dg_rigl = DynamicGateRigLMLP(
+        in_dim, H1, H2, OUT,
+        tau=TAU_HI, thr=GATE_THR_WARM, p0=GATE_P0,
+        rank1=GATE_RANK1, rank2=GATE_RANK2,
+        density1=RIGL_DENSITY1, density2=RIGL_DENSITY2,
+        rigl_delta=RIGL_DELTA, rigl_interval=RIGL_INTERVAL,
+        init_scale=INIT_SCALE
+    )
+    dg_rigl = train_dynamicgate_rigl(
+        dg_rigl, train_loader, val_loader, loss_fn, y_classes,
+        epochs=EPOCHS, lr=LR, weight_decay=WEIGHT_DECAY,
+        tau_hi=TAU_HI, tau_lo=TAU_LO,
+        thr_warm=GATE_THR_WARM, thr_final=GATE_THR_FINAL,
+        phase1_frac=PHASE1_FRAC, phase2_frac=PHASE2_FRAC,
+        target1_stage1=T1_S1, target2_stage1=T2_S1,
+        target1_stage2=T1_S2, target2_stage2=T2_S2,
+        target1_stage3=T1_S3, target2_stage3=T2_S3,
+        lambda_g=LAMBDA_G,
+        warmup_epochs=GATE_WARMUP_EPOCHS,
+        f1_eps=F1_EPS,
+        desc="DynamicGate+RigL"
+    )
+    m_dgr = evaluate(dg_rigl, test_loader, class_names=y_classes, detail=False)
+
+    open1_dgr, open2_dgr = estimate_open_rates_dynamic_any(dg_rigl, test_loader, max_batches=OPENRATE_MAX_BATCHES)
+    dens1, dens2 = dg_rigl.weight_densities()
+    dgr_macs = (
+        in_dim*(H1*open1_dgr)*dens1 +
+        (H1*open1_dgr)*(H2*open2_dgr)*dens2 +
+        (H2*open2_dgr)*OUT
+    )
+    sec = time.time() - t0
+
+    rows.append({
+        "seed": seed, "model": "DynamicGate+RigL", "seconds": sec,
+        **m_dgr,
+        "macs": float(dgr_macs),
+        "macs_reduct_pct": float((1.0 - dgr_macs/base_macs) * 100.0),
+        "open1": float(open1_dgr), "open2": float(open2_dgr),
+        "dens1": float(dens1), "dens2": float(dens2), "nz_ratio": np.nan
+    })
+    cleanup()
+    ram(f"after seed {seed}")
+
+# -------------------------
+# 12) Aggregate results
+# -------------------------
+df = pd.DataFrame(rows)
+print("\n==================== ALL SEEDS (raw head) ====================")
+print(df.head(6))
+
+summary = (
+    df.groupby("model")
+      .agg(
+          acc_mean=("acc", "mean"),
+          acc_std=("acc", "std"),
+          micro_f1_mean=("micro_f1", "mean"),
+          micro_f1_std=("micro_f1", "std"),
+          macro_f1_mean=("macro_f1", "mean"),
+          macro_f1_std=("macro_f1", "std"),
+          macs_mean=("macs", "mean"),
+          macs_std=("macs", "std"),
+          macs_reduct_pct_mean=("macs_reduct_pct", "mean"),
+          macs_reduct_pct_std=("macs_reduct_pct", "std"),
+          seconds_mean=("seconds", "mean"),
+          seconds_std=("seconds", "std"),
+      )
+      .reset_index()
+      .sort_values("macs_mean")
+)
+print("\n==================== SUMMARY (mean ± std) ====================")
+print(summary)
+
+df.to_csv("results_by_seed_raw.csv", index=False)
+summary.to_csv("results_summary_mean_std.csv", index=False)
+print("\nSaved:")
+print(" - results_by_seed_raw.csv")
+print(" - results_summary_mean_std.csv")
+
+# -------------------------
+# 13) MACs-Acc Pareto Plot
+# -------------------------
+plt.figure(figsize=(10,6))
+for _, r in summary.iterrows():
+    plt.errorbar(
+        r["macs_mean"], r["acc_mean"],
+        xerr=r["macs_std"] if np.isfinite(r["macs_std"]) else None,
+        yerr=r["acc_std"] if np.isfinite(r["acc_std"]) else None,
+        fmt="o", capsize=3
+    )
+    plt.text(r["macs_mean"], r["acc_mean"], str(r["model"]), fontsize=10, ha="left", va="bottom")
+
+pf = pareto_front(summary, x_col="macs_mean", y_col="acc_mean")
+plt.plot(pf["macs_mean"].values, pf["acc_mean"].values, linewidth=2)
+
+plt.title("PBMC3k: MACs–Accuracy Pareto (mean±std over seeds)")
+plt.xlabel("MACs (mean)")
+plt.ylabel("Accuracy (%) (mean)")
+plt.grid(True, linestyle="--", alpha=0.4)
+plt.tight_layout()
+plt.savefig("macs_acc_pareto.png", dpi=150)
+print("\nSaved: macs_acc_pareto.png")
+
+ram("end")
