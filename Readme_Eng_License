@@ -1,0 +1,29 @@
+License
+
+The source code in this repository (code/scripts and code-related documentation) is released under the Apache License 2.0.
+See LICENSE and NOTICE for details.
+
+Commercial / Enterprise Licensing
+
+This project follows an open-core approach: the core code is open source (Apache 2.0), while certain enterprise-grade features/packages for production use may be available under a separate commercial license, such as:
+
+Hardware/NPU/on-device optimized kernels and runtime
+
+Deployment/monitoring/audit logging/governance features
+
+Long-term support (LTS), SLA, support/consulting, and custom integrations (e.g., SSO)
+
+For enterprise use, collaboration, PoC, or licensing inquiries, please contact:
+
+Contact: hurstchoi@sorynory.com
+
+Model Weights and Datasets
+
+Any model weights (if provided) and data/checkpoints/training artifacts may be distributed under licenses different from the source code.
+Please refer to the corresponding WEIGHTS_LICENSE (or the specific notice provided with each asset).
+
+Notes (Patents / Contributions)
+
+Apache 2.0 includes an explicit patent license grant (see the license text for details).
+
+Contributions may be accepted under the project’s contribution policy (e.g., DCO/CLA). See CONTRIBUTING.md if applicable.
