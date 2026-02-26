@@ -1,0 +1,556 @@
+# ===== One-Cell Colab Script: A/B/C/D (None / θ-only / W-inactive-only / θ+W-inactive) =====
+# - Models: Dense, DynamicGate (Hard/Soft/Anneal), MoE (Top1/Soft)
+# - Drift: noise + blur
+# - Offline train first (clean data), then evaluate clean/drift
+# - Online adapt under drift stream with 4 modes:
+#    A none
+#    B theta_only (gate/router only)
+#    C w_inactive_only (DynamicGate only: update W only on INACTIVE units via gradient masking)
+#    D theta_and_w_inactive (DynamicGate only)
+#
+# Notes:
+# - For Dense: no gate/router -> B/C/D skipped automatically.
+# - For MoE: supports B (router-only) and D (router+experts) as an optional counterpart,
+#            but "inactive-only" is not well-defined the same way as unit-level; C is skipped.
+# - This cell is designed to run as-is.
+
+import os, math, random, time
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, Subset
+import matplotlib.pyplot as plt
+
+# ----------------------------
+# 0) Repro + Device
+# ----------------------------
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+set_seed(42)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+# ----------------------------
+# 1) Data (MNIST, fast subsample)
+# ----------------------------
+BATCH = 500
+transform = transforms.Compose([transforms.ToTensor()])
+
+train_ds = datasets.MNIST(root="./data", train=True, download=True, transform=transform)
+test_ds  = datasets.MNIST(root="./data", train=False, download=True, transform=transform)
+
+# speed-up (optional)
+idx = list(range(len(train_ds)))
+random.shuffle(idx)
+train_ds = Subset(train_ds, idx[:30000])
+
+train_loader = DataLoader(train_ds, batch_size=BATCH, shuffle=True, num_workers=2, pin_memory=True)
+test_loader  = DataLoader(test_ds,  batch_size=BATCH, shuffle=False, num_workers=2, pin_memory=True)
+
+# ----------------------------
+# 2) Drift function (noise + cheap blur)
+# ----------------------------
+def cheap_blur(x, k=3):
+    w = torch.ones(1, 1, k, k, device=x.device) / (k*k)
+    x_pad = F.pad(x, (k//2, k//2, k//2, k//2), mode="reflect")
+    return F.conv2d(x_pad, w)
+
+def apply_drift(x, noise_std=0.5, blur_k=3):
+    x2 = x + torch.randn_like(x) * noise_std
+    x2 = torch.clamp(x2, 0, 1)
+    if blur_k is not None and blur_k > 1:
+        x2 = cheap_blur(x2, k=blur_k)
+    return torch.clamp(x2, 0, 1)
+
+# ----------------------------
+# 3) Metrics helpers
+# ----------------------------
+@torch.no_grad()
+def accuracy(model, loader, drift=False):
+    model.eval()
+    correct, total = 0, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        if drift:
+            x = apply_drift(x)
+        logits, aux = model(x)
+        pred = logits.argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.numel()
+    return correct / total
+
+def flip_rate(prev_route, route):
+    if prev_route is None or route is None:
+        return None
+    if isinstance(route, torch.Tensor) and route.dtype == torch.long:
+        return (route != prev_route).float().mean().item()
+    # boolean/float mask
+    return (route != prev_route).float().mean().item()
+
+@torch.no_grad()
+def eval_routing_stats(model, loader, drift=False, max_batches=30):
+    model.eval()
+    prev_route = None
+    flips, ars = [], []
+    for bi, (x, y) in enumerate(loader):
+        if bi >= max_batches:
+            break
+        x = x.to(device)
+        if drift:
+            x = apply_drift(x)
+        logits, aux = model(x)
+        route = aux.get("route", None)
+        ar = float(aux.get("active_ratio", 1.0))
+        ars.append(ar)
+        if route is not None:
+            fr = flip_rate(prev_route, route)
+            if fr is not None:
+                flips.append(fr)
+            prev_route = route
+    flip_avg = float(np.mean(flips)) if len(flips) else None
+    ar_avg = float(np.mean(ars)) if len(ars) else 1.0
+    return flip_avg, ar_avg
+
+def flops_proxy(active_ratio, base=1.0):
+    return base * float(active_ratio)
+
+# ----------------------------
+# 4) Models
+# ----------------------------
+class DenseMLP(nn.Module):
+    def __init__(self, hidden=256):
+        super().__init__()
+        self.fc1 = nn.Linear(784, hidden)
+        self.fc2 = nn.Linear(hidden, 10)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        h = F.relu(self.fc1(x))
+        out = self.fc2(h)
+        return out, {"route": None, "active_ratio": 1.0}
+
+class DynamicGateLayer(nn.Module):
+    def __init__(self, dim, mode="soft", k_ratio=0.3, temperature=1.0):
+        super().__init__()
+        self.gate = nn.Linear(dim, dim)  # θ
+        self.mode = mode
+        self.k_ratio = k_ratio
+        self.temperature = temperature
+
+    def forward(self, h):
+        score = self.gate(h)
+        if self.mode == "soft":
+            mask = torch.sigmoid(score / self.temperature)
+        elif self.mode == "hard":
+            k = max(1, int(h.size(1) * self.k_ratio))
+            topk = torch.topk(score, k, dim=1).indices
+            mask = torch.zeros_like(score)
+            mask.scatter_(1, topk, 1.0)
+        elif self.mode == "anneal":
+            mask = torch.sigmoid(score / self.temperature)
+        else:
+            raise ValueError("Unknown mode")
+        h2 = h * mask
+        ar = mask.mean().item()
+        return h2, mask, ar
+
+class DGMLP(nn.Module):
+    """
+    DynamicGate MLP with INACTIVE-ONLY W update capability.
+    - We define "inactive units" per step as units whose batch-mean mask < inactive_threshold.
+    - We mask gradients so only those inactive units' rows/columns in fc1/fc2 are updated.
+    """
+    supports_inactive_w = True
+
+    def __init__(self, hidden=256, mode="soft", k_ratio=0.3, temperature=1.0):
+        super().__init__()
+        self.fc1 = nn.Linear(784, hidden)
+        self.dg  = DynamicGateLayer(hidden, mode=mode, k_ratio=k_ratio, temperature=temperature)
+        self.fc2 = nn.Linear(hidden, 10)
+        self.mode = mode
+
+        self._last_mask = None           # [B,H] from last forward
+        self._inactive_unit_mask = None  # [H] float 1=inactive, 0=active
+        self._hooks_registered = False
+        self._register_inactive_only_hooks()
+
+    def _register_inactive_only_hooks(self):
+        if self._hooks_registered:
+            return
+        self._hooks_registered = True
+
+        # fc2.weight: [10, H] -> mask columns (H)
+        def hook_fc2_weight(grad):
+            if self._inactive_unit_mask is None:
+                return grad
+            return grad * self._inactive_unit_mask.view(1, -1)
+
+        # fc1.weight: [H, 784] -> mask rows (H)
+        def hook_fc1_weight(grad):
+            if self._inactive_unit_mask is None:
+                return grad
+            return grad * self._inactive_unit_mask.view(-1, 1)
+
+        # fc1.bias: [H] -> mask elements (H)
+        def hook_fc1_bias(grad):
+            if self._inactive_unit_mask is None:
+                return grad
+            return grad * self._inactive_unit_mask
+
+        self.fc2.weight.register_hook(hook_fc2_weight)
+        self.fc1.weight.register_hook(hook_fc1_weight)
+        self.fc1.bias.register_hook(hook_fc1_bias)
+        # fc2.bias left unmasked (optional). If you want, you can freeze it in W-only mode.
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        h = F.relu(self.fc1(x))
+        h2, mask, ar = self.dg(h)
+        self._last_mask = mask  # keep non-detached for inactive computation
+        out = self.fc2(h2)
+        return out, {"route": mask.detach(), "active_ratio": ar}
+
+def set_inactive_unit_mask_from_batch(model: DGMLP, inactive_threshold=0.5):
+    """
+    Computes per-unit inactivity from the last forward mask:
+      inactive[u] = 1 if mean(mask[:,u]) < threshold else 0
+    """
+    with torch.no_grad():
+        if model._last_mask is None:
+            model._inactive_unit_mask = None
+            return
+        m = model._last_mask.mean(dim=0)  # [H]
+        model._inactive_unit_mask = (m < inactive_threshold).float()
+
+class MoE_MLP(nn.Module):
+    supports_inactive_w = False
+    def __init__(self, hidden=256, n_experts=4, variant="moe_top1", temperature=1.0):
+        super().__init__()
+        self.fc1 = nn.Linear(784, hidden)
+        self.router = nn.Linear(hidden, n_experts)  # θ (expert-level)
+        self.experts = nn.ModuleList([
+            nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
+            for _ in range(n_experts)
+        ])
+        self.fc2 = nn.Linear(hidden, 10)
+        self.variant = variant
+        self.temperature = temperature
+        self.n_experts = n_experts
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        h = F.relu(self.fc1(x))
+        logits_r = self.router(h)  # [B,E]
+
+        if self.variant == "moe_top1":
+            idx = torch.argmax(logits_r, dim=1)  # [B]
+            h2 = torch.zeros_like(h)
+            for e in range(self.n_experts):
+                m = (idx == e)
+                if m.any():
+                    h2[m] = self.experts[e](h[m])
+            active_ratio = 1.0 / self.n_experts
+            route = idx.detach()
+
+        elif self.variant == "moe_soft":
+            w = F.softmax(logits_r / self.temperature, dim=1)  # [B,E]
+            outs = [self.experts[e](h) for e in range(self.n_experts)]  # all experts computed
+            stacked = torch.stack(outs, dim=1)  # [B,E,H]
+            h2 = (w.unsqueeze(-1) * stacked).sum(dim=1)
+            active_ratio = 1.0
+            route = torch.argmax(w, dim=1).detach()
+        else:
+            raise ValueError("Unknown MoE variant")
+
+        out = self.fc2(h2)
+        return out, {"route": route, "active_ratio": active_ratio}
+
+# ----------------------------
+# 5) Offline training
+# ----------------------------
+def train_offline(model, epochs=10, lr=1e-3):
+    model.to(device)
+    model.train()
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    for ep in range(epochs):
+        t0 = time.time()
+        total_loss = 0.0
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+            logits, aux = model(x)
+            loss = F.cross_entropy(logits, y)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            total_loss += loss.item() * y.size(0)
+        total_loss /= len(train_loader.dataset)
+        print(f"  [offline] ep {ep+1}/{epochs} loss={total_loss:.4f} time={time.time()-t0:.1f}s")
+    return model
+
+# ----------------------------
+# 6) A/B/C/D update modes
+# ----------------------------
+MODES = {
+    "A_none": "none",
+    "B_theta_only": "theta_only",
+    "C_w_inactive_only": "w_inactive_only",
+    "D_theta_and_w_inactive": "theta_and_w_inactive",
+}
+
+def set_update_mode(model, mode_str):
+    """
+    mode_str: none / theta_only / w_inactive_only / theta_and_w_inactive
+    - For DG: supports all modes (C/D via gradient masking + inactive unit mask)
+    - For MoE:
+        theta_only => train router only
+        theta_and_w_inactive => train router + experts (closest analog)
+        w_inactive_only => not supported (skip)
+    - For Dense: only none (skip others)
+    """
+    # default: freeze everything
+    for _, p in model.named_parameters():
+        p.requires_grad = False
+
+    if mode_str == "none":
+        return True
+
+    # Dense: no router/gate
+    if isinstance(model, DenseMLP):
+        return False
+
+    # DG case
+    if isinstance(model, DGMLP):
+        # Handle non-differentiable hard gating for theta_only updates
+        if model.mode == "hard" and mode_str == "theta_only":
+            return False # Hard gating breaks gradient flow for theta_only update
+
+        if mode_str == "theta_only":
+            for n, p in model.named_parameters():
+                if "dg.gate" in n:
+                    p.requires_grad = True
+            return True
+        if mode_str == "w_inactive_only":
+            for n, p in model.named_parameters():
+                if ("fc1" in n) or ("fc2" in n):
+                    p.requires_grad = True
+            return True
+        if mode_str == "theta_and_w_inactive":
+            for n, p in model.named_parameters():
+                if ("dg.gate" in n) or ("fc1" in n) or ("fc2" in n):
+                    p.requires_grad = True
+            return True
+        return False
+
+    # MoE case
+    if isinstance(model, MoE_MLP):
+        # Handle non-differentiable top1 routing for theta_only updates
+        if model.variant == "moe_top1" and mode_str == "theta_only":
+            return False # Top1 routing breaks gradient flow for theta_only update
+
+        if mode_str == "theta_only":
+            for n, p in model.named_parameters():
+                if "router" in n:
+                    p.requires_grad = True
+            return True
+        if mode_str == "theta_and_w_inactive":
+            # analog: router + expert weights (NOT inactive-only, but "full W")
+            for n, p in model.named_parameters():
+                if ("router" in n) or ("experts" in n) or ("fc2" in n):
+                    p.requires_grad = True
+            return True
+        if mode_str == "w_inactive_only":
+            return False
+        return False
+
+    return False
+
+def online_adapt(model, mode_str, steps=200, lr=2e-4, drift=True, inactive_threshold=0.5):
+    model.to(device)
+    ok = set_update_mode(model, mode_str)
+    if not ok:
+        return None, 0, f"SKIP(mode={mode_str})"
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    if len(params) == 0:
+        return None, 0, f"SKIP(no trainable params)"
+
+    opt = torch.optim.Adam(params, lr=lr)
+    model.train()
+
+    it = iter(train_loader)
+    losses = []
+    for t in range(steps):
+        try:
+            x, y = next(it)
+        except StopIteration:
+            it = iter(train_loader)
+            x, y = next(it)
+
+        x, y = x.to(device), y.to(device)
+        if drift:
+            x = apply_drift(x)
+
+        logits, aux = model(x)
+
+        # For DG in C/D: update inactive mask per step (controls gradient masking)
+        if isinstance(model, DGMLP) and mode_str in ["w_inactive_only", "theta_and_w_inactive"]:
+            set_inactive_unit_mask_from_batch(model, inactive_threshold=inactive_threshold)
+        else:
+            # Make sure no stale mask affects other modes
+            if isinstance(model, DGMLP):
+                model._inactive_unit_mask = None
+
+        loss = F.cross_entropy(logits, y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        losses.append(float(loss.item()))
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return losses, trainable, "OK"
+
+# ----------------------------
+# 7) Run: Offline -> Evaluate -> A/B/C/D Adapt -> Evaluate
+# ----------------------------
+OFFLINE_EPOCHS = 10
+ONLINE_STEPS   = 200
+ONLINE_LR      = 2e-4
+
+# inactive threshold tuning:
+# - DG-Hard: 0.5 recommended
+# - DG-Soft/Anneal: 0.3~0.5 (0.4 is a good start)
+INACTIVE_THRESHOLD_DEFAULT = 0.3
+
+models = {
+    "Dense": DenseMLP(hidden=256),
+    "DG-Hard": DGMLP(hidden=256, mode="hard", k_ratio=0.3, temperature=1.0),
+    "DG-Soft": DGMLP(hidden=256, mode="soft", k_ratio=0.3, temperature=1.0),
+    "DG-Anneal": DGMLP(hidden=256, mode="anneal", k_ratio=0.3, temperature=3.0),
+    "MoE-Top1": MoE_MLP(hidden=256, n_experts=4, variant="moe_top1", temperature=1.0),
+    "MoE-Soft": MoE_MLP(hidden=256, n_experts=4, variant="moe_soft", temperature=1.0),
+}
+
+print("\n=== Offline Training ===")
+for name, m in models.items():
+    print(f"\nModel: {name}")
+    models[name] = train_offline(m, epochs=OFFLINE_EPOCHS, lr=1e-3)
+
+# baseline eval (before any online adaptation)
+baseline = {}
+print("\n=== Eval (Before Online Adaptation) ===")
+for name, m in models.items():
+    clean_acc = accuracy(m, test_loader, drift=False)
+    drift_acc = accuracy(m, test_loader, drift=True)
+    flip_drift, ar_drift = eval_routing_stats(m, test_loader, drift=True)
+    baseline[name] = dict(clean_acc=clean_acc, drift_acc=drift_acc, flip_drift=flip_drift, ar_drift=ar_drift)
+
+# store results per (model, mode)
+results = {}
+loss_curves = {}
+
+print("\n=== Online Adaptation: A/B/C/D ===")
+for name, m in models.items():
+    for mode_name, mode_str in MODES.items():
+        # per-model threshold tuning (optional)
+        thr = INACTIVE_THRESHOLD_DEFAULT
+        if name == "DG-Hard":
+            thr = 0.5
+
+        losses, trainable, status = online_adapt(
+            m, mode_str,
+            steps=ONLINE_STEPS,
+            lr=ONLINE_LR,
+            drift=True,
+            inactive_threshold=thr
+        )
+        if status == "OK":
+            loss_curves[(name, mode_name)] = losses
+
+            # anneal: after online, sharpen for DG-Anneal
+            if name == "DG-Anneal":
+                m.dg.temperature = 1.0
+
+            adapt_acc = accuracy(m, test_loader, drift=True)
+            clean_after = accuracy(m, test_loader, drift=False)  # forget check
+            flip_drift, ar_drift = eval_routing_stats(m, test_loader, drift=True)
+
+            results[(name, mode_name)] = {
+                "status": "OK",
+                "trainable": trainable,
+                "clean_before": baseline[name]["clean_acc"],
+                "drift_before": baseline[name]["drift_acc"],
+                "adapt_acc": adapt_acc,
+                "clean_after": clean_after,
+                "clean_drop": clean_after - baseline[name]["clean_acc"],
+                "flip_drift": flip_drift,
+                "ar_drift": ar_drift,
+                "flops": flops_proxy(ar_drift),
+                "thr": thr,
+            }
+        else:
+            results[(name, mode_name)] = {
+                "status": status,
+                "trainable": trainable,
+                "clean_before": baseline[name]["clean_acc"],
+                "drift_before": baseline[name]["drift_acc"],
+                "adapt_acc": None,
+                "clean_after": None,
+                "clean_drop": None,
+                "flip_drift": None,
+                "ar_drift": None,
+                "flops": None,
+                "thr": thr,
+            }
+
+# ----------------------------
+# 8) Print summary tables (per model, modes A/B/C/D)
+# ----------------------------
+print("\n=== Summary (A/B/C/D) ===")
+header = f"{'Model':<10} | {'Mode':<20} | {'DriftBefore':>11} | {'AdaptAcc':>8} | {'Recovery':>8} | {'CleanDrop':>9} | {'Flip':>7} | {'AR':>6} | {'FLOPs~':>6} | {'θ/W params':>10} | {'Status':<18}"
+print(header)
+print("-"*len(header))
+for name in models.keys():
+    for mode_name in MODES.keys():
+        r = results[(name, mode_name)]
+        if r["status"] == "OK":
+            recovery = (r["adapt_acc"] - r["drift_before"]) * 100
+            dd = r["drift_before"] * 100
+            aa = r["adapt_acc"] * 100
+            cd = r["clean_drop"] * 100
+            flip = r["flip_drift"]
+            flip_s = "None" if flip is None else f"{flip:.3f}"
+            print(f"{name:<10} | {mode_name:<20} | {dd:11.2f} | {aa:8.2f} | {recovery:8.2f} | {cd:9.2f} | {flip_s:>7} | {r['ar_drift']:>6.3f} | {r['flops']:>6.2f} | {r['trainable']:10d} | {r['status']:<18}")
+        else:
+            dd = r["drift_before"] * 100
+            print(f"{name:<10} | {mode_name:<20} | {dd:11.2f} | {'-':>8} | {'-':>8} | {'-':>9} | {'-':>7} | {'-':>6} | {'-':>6} | {r['trainable']:10d} | {r['status']:<18}")
+
+# ----------------------------
+# 9) Plot: for one model, show loss curves by mode (optional)
+# ----------------------------
+def plot_loss_for_model(model_name):
+    plt.figure()
+    for mode_name in MODES.keys():
+        key = (model_name, mode_name)
+        if key in loss_curves:
+            plt.plot(loss_curves[key], label=mode_name)
+    plt.title(f"Online Adaptation Loss by Mode (Model={model_name})")
+    plt.xlabel("Step")
+    plt.ylabel("CE Loss")
+    plt.legend()
+    plt.show()
+
+# Example plots (uncomment if you want)
+plot_loss_for_model("DG-Soft")
+plot_loss_for_model("DG-Hard")
+plot_loss_for_model("MoE-Top1")
+
+print("\nDone.")
+print("Tips:")
+print("- If C (w_inactive_only) is too weak/too strong, adjust INACTIVE_THRESHOLD_DEFAULT (0.3~0.6).")
+print("- For clearer separation, increase OFFLINE_EPOCHS (5~10) or ONLINE_STEPS (500).")
